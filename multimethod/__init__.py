@@ -387,6 +387,15 @@ class multimethod(dict):
             func = self.pending.pop()
             self[signature.from_hints(func)] = func
 
+    def analyze(self):
+        """Return a static ambiguity report of this registry without dispatching.
+
+        See :mod:`multimethod.analysis`.  Runtime dispatch stays authoritative.
+        """
+        from .analysis import analyze as _analyze
+
+        return _analyze(self)
+
     @property
     def docstring(self):
         """a descriptive docstring of all registered functions"""
@@ -450,3 +459,11 @@ class multimeta(type):
             if callable(value):
                 value = getattr(self.get(key), "register", multimethod)(value)
             super().__setitem__(key, value)
+
+
+def __getattr__(name):
+    if name in ("analyze", "AnalysisReport", "Confidence", "Finding"):
+        from . import analysis
+
+        return getattr(analysis, name)
+    raise AttributeError(name)

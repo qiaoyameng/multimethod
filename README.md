@@ -107,6 +107,25 @@ Coroutine = parametric(Callable, inspect.iscoroutinefunction)
 IntArray = parametric(array, typecode="i")
 ```
 
+### static analysis
+`analyze` inspects the registry without dispatching, so ambiguous overload groups can be found before any real request arrives. It never calls a registered function, never invokes user predicates, and never instantiates user classes; witnesses are safe values or descriptions of existing concrete types.
+
+```python
+from multimethod import multimethod
+from multimethod.analysis import analyze
+
+@multimethod
+def func(x: object, y: int): ...
+
+@multimethod
+def func(x: int, y: object): ...
+
+report = analyze(func)
+report.ambiguous  # [Finding(...)] witness (0, 0) with no unique more specific candidate
+```
+
+Each overlapping signature pair is reported as `ambiguous` (an inhabited witness proves a tie), `covered` (a third more specific overload owns the whole intersection, so already-resolved diamonds stay silent), or `unknown` with explicit reasons for complex ABCs, `parametric` predicates, and future multiple-inheritance subclasses. Registering or deleting overloads updates the next report; runtime dispatch remains the final authority.
+
 ### classes
 `classmethod` and `staticmethod` may be used with a multimethod, but must be applied _last_, i.e., wrapping the final multimethod definition after all functions are registered. For class and instance methods, `cls` and `self` participate in the dispatch as usual. They may be left blank when using annotations, otherwise use `object` as a placeholder.
 

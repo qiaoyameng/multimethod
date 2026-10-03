@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
+### Added
+* `multimethod.analysis.analyze` — registry-only static ambiguity checker; also available as `multimethod.analyze` / `method.analyze()`. Reports provable ambiguity, third-overload coverage (including resolved diamonds), and conservative unknowns for complex ABCs, `parametric` predicates and future multiple-inheritance subclasses. Never dispatches, calls user code, or constructs witnesses.
 
 ## [2.1](https://pypi.org/project/multimethod/2.1/) - 2026-07-28
 ### Changed

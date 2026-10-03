@@ -1,0 +1,43 @@
+==================== TRUE AMBIGUITY ====================
+
+### two-argument cross-product: (object, int) vs (int, object)
+[ambiguous] 1 pair(s)
+  ambiguous: ((object, int), (int, object))
+    witness: (0, 0)
+    reason: no unique more specific candidate
+
+### literal overlap on 'b'
+[ambiguous] 1 pair(s)
+  ambiguous: ((typing.Literal['a', 'b']), (typing.Literal['b', 'c']))
+    witness: ('b')
+    reason: no unique more specific candidate
+
+==================== COVERED (resolved, no warning) ====================
+
+### diamond resolved by third overload (int, int)
+[covered] 1 pair(s)
+  covered: ((object, int), (int, object))
+    reason: intersection resolved by (int, int)
+
+### normal inheritance object -> int -> bool
+no overlapping signature pairs
+
+### concrete containers with incompatible layouts: list[int] vs dict[str, int]
+no overlapping signature pairs
+
+==================== CANNOT PROVE (unknown, with reasons) ====================
+
+### complex ABCs: Iterable vs Hashable
+[unknown] 1 pair(s)
+  unknown: ((Iterable), (Hashable))
+    reason: arg 0: complex ABC intersection of <class 'collections.abc.Iterable'> and <class 'collections.abc.Hashable'> cannot be proved
+
+### parametric predicates (never called during analysis)
+[unknown] 1 pair(s)
+  unknown: ((int), (int))
+    reason: arg 0: parametric predicates cannot be decided without calling them
+
+### future multiple-inheritance subclass: Left vs Right
+[unknown] 1 pair(s)
+  unknown: ((Left), (Right))
+    reason: arg 0: a future subclass of both <class '__main__.Left'> and <class '__main__.Right'> may exist
