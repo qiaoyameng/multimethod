@@ -66,6 +66,7 @@ Multimethods support any types that satisfy the `issubclass` relation, including
 * `type[...]` - `issubclass` of type
 * `Literal[...]` - equality and type match
 * `Callable[[...], ...]` - parameter types are contravariant, return type is covariant
+* Repeated `TypeVar`s - repeated occurrences in one signature must bind to the same type
 
 Naturally checking subscripts is slower, but the implementation is optimized, cached, and bypassed if no subscripts are in use in the parameter. Empty iterables match any subscript, but don't special-case how the types are normally resolved.
 
@@ -75,6 +76,21 @@ Dispatch resolution details:
 * Keyword-only parameters may be annotated, but won't affect dispatching.
 * A skipped annotation is equivalent to `: object`.
 * If no types are specified, it will inherently match all arguments.
+
+### type variables
+Repeated occurrences of the same `TypeVar` describe one binding within each candidate signature. Each matching candidate gets an independent binding, so a failed candidate never leaves a binding that can change the result for another candidate.
+
+The unified rule is intentionally limited to ordinary types, constrained or bounded `TypeVar`s, and type variables nested in `tuple`, `list`, and `dict` annotations:
+
+* A value must satisfy the variable's bound or constraints. `bool` satisfies a bound of `int`, and a subclass satisfies its base class.
+* A repeated variable must infer the exact runtime type at every occurrence. `bool` and `int` are different bindings, as are a subclass and its base class.
+* Fixed-length and variable-length `tuple`s provide evidence at every position. Lists provide evidence from their first item, matching the existing content-check rule.
+* `dict` provides evidence from the first key-value pair.
+* An empty container provides no evidence at that position. Missing evidence never forces a binding to `object` or fails an otherwise valid candidate.
+* After the bindings are known, the instantiated candidate is compared with concrete overloads. An exact generic binding is more specific than a matching base-class overload; an ordinary concrete overload wins when its runtime pattern is equally specific. Incompatible patterns fall through to `object`, and incomparable applicable overloads remain ambiguous.
+* Dispatch cache keys include the runtime type evidence inferred from container contents, so `[1]` and `[False]` never share a result merely because both have outer type `list`.
+
+For example, a `(T, T)` candidate selects `(1, 1)` and `(False, False)`, but not `(1, False)`. Nested `list[T]` accepts `[1], [2]` and `[True], [False]`, rejects `[1], [False]`, and treats an empty list as no evidence. Distinct variables remain independent, as in `dict[K, V]` paired with `tuple[K, V]`: `{1: "a"}` matches `(1, "b")`, but not `("1", "a")`.
 
 ### multidispatch
 `multidispatch` is a wrapper to provide compatibility with `functools.singledispatch`. It requires a base implementation and use of the `register` method instead of namespace lookup. It also supports dispatching on keyword arguments.

@@ -49,7 +49,7 @@ class subtype(abc.ABCMeta):
             case typing.NewType():
                 return cls(tp.__supertype__)
             case TypeVar():
-                return cls(Union[tp.__constraints__]) if tp.__constraints__ else object
+                return typevariable(tp)
             case typing._AnnotatedAlias():
                 return cls(tp.__origin__)
             case TypeAliasType():
@@ -209,6 +209,252 @@ class parametric(abc.ABCMeta):
 subtype.origins.register(parametric, lambda cls: cls.__bases__)
 
 
+class typevariable(subtype):
+    """A normalized `TypeVar` which retains its identity within a signature."""
+
+    __typevar__: TypeVar
+
+    def __new__(cls, tp: TypeVar):
+        self = typevariables.get(tp)
+        if self is None:
+            namespace = {"__origin__": object, "__args__": (), "__typevar__": tp}
+            self = type.__new__(cls, str(tp), (object,), namespace)
+            typevariables[tp] = self
+        return self
+
+    def key(self) -> tuple:
+        return typevariable, self.__typevar__
+
+    def __subclasscheck__(self, subclass):
+        tp = self.__typevar__
+        if isinstance(subclass, typevariable):
+            return variable_satisfies(subclass.__typevar__, tp)
+        if tp.__constraints__:
+            return any(
+                issubclass(subclass, subtype(constraint)) for constraint in tp.__constraints__
+            )
+        return tp.__bound__ is not None and issubclass(subclass, subtype(tp.__bound__))
+
+    def __instancecheck__(self, instance):
+        tp = self.__typevar__
+        if tp.__constraints__:
+            return isinstance(instance, tuple(map(subtype, tp.__constraints__)))
+        return isinstance(instance, subtype(tp.__bound__ or object))
+
+
+typevariables: dict[TypeVar, typevariable] = {}
+
+
+def variable_satisfies(sub: TypeVar, sup: TypeVar) -> bool:
+    """Return whether every type accepted by `sub` is accepted by `sup`."""
+    if not sup.__bound__ and not sup.__constraints__:
+        return not sub.__bound__ and not sub.__constraints__
+    sub_types = sub.__constraints__ or (sub.__bound__ or object,)
+    if sup.__constraints__:
+        bound = subtype(Union[sup.__constraints__])
+    else:
+        bound = subtype(sup.__bound__ or object)
+    return all(issubclass(subtype(tp), bound) for tp in sub_types)
+
+
+def has_typevariable(tp) -> bool:
+    if isinstance(tp, typevariable):
+        return True
+    return any(has_typevariable(arg) for arg in get_args(tp))
+
+
+def typevariables_in(tp, variables: set[TypeVar]) -> None:
+    if isinstance(tp, typevariable):
+        variables.add(tp.__typevar__)
+    for arg in get_args(tp):
+        typevariables_in(arg, variables)
+
+
+def pattern_issubclass(sub, sup, bindings: dict[TypeVar, object]) -> bool:
+    """Check normalized signature types, unifying repeated TypeVars in `sup`."""
+    if not has_typevariable(sub) and not has_typevariable(sup):
+        return issubclass(sub, sup)
+    if isinstance(sup, typevariable):
+        variable = sup.__typevar__
+        existing = bindings.get(variable)
+        if existing is not None:
+            if isinstance(existing, typevariable):
+                return sub is existing
+            return not isinstance(sub, typevariable) and issubclass(sub, existing)
+        if isinstance(sub, typevariable):
+            if not variable_satisfies(sub.__typevar__, variable):
+                return False
+        elif variable.__bound__ is not None or variable.__constraints__:
+            if not issubclass(sub, sup):
+                return False
+        bindings[variable] = sub
+        return True
+    if isinstance(sub, typevariable):
+        return issubclass(sub, sup)
+
+    sub_origin = get_origin(sub)
+    if sub_origin is None:
+        sub_origin = sub
+    sup_origin = get_origin(sup)
+    if sup_origin is None:
+        sup_origin = sup
+    if sup_origin in (typing.Union, types.UnionType):
+        return any(
+            pattern_issubclass(sub, arg, bindings.copy())
+            for arg in get_args(sup)
+        )
+    if sub_origin in (typing.Union, types.UnionType):
+        return all(pattern_issubclass(arg, sup, bindings) for arg in get_args(sub))
+    if not isinstance(sup_origin, type) or not issubclass(sub_origin, sup_origin):
+        return False
+
+    sub_args = get_args(sub)
+    sup_args = get_args(sup)
+    if not sup_args:
+        return True
+    if sup_origin is tuple and ... in sup_args:
+        return all(
+            arg is ... or pattern_issubclass(arg, sup_args[0], bindings) for arg in sub_args
+        )
+    if len(sub_args) != len(sup_args):
+        return False
+    return all(
+        pattern_issubclass(sub_arg, sup_arg, bindings)
+        for sub_arg, sup_arg in zip(sub_args, sup_args)
+    )
+
+
+def bind_typevariable(bindings: dict[TypeVar, type], variable: TypeVar, tp: type) -> bool:
+    existing = bindings.get(variable)
+    if existing is None:
+        bindings[variable] = tp
+        return True
+    return tp is existing
+
+
+def typevariable_accepts(tp: TypeVar, instance) -> bool:
+    if tp.__constraints__:
+        return any(
+            issubclass(type(instance), subtype(constraint)) for constraint in tp.__constraints__
+        )
+    return issubclass(type(instance), subtype(tp.__bound__ or object))
+
+
+def instance_match(tp, instance, bindings: dict[TypeVar, type]) -> bool:
+    """Match an instance against a normalized parameterized signature type."""
+    if isinstance(tp, typevariable):
+        variable = tp.__typevar__
+        return typevariable_accepts(variable, instance) and bind_typevariable(
+            bindings, variable, type(instance)
+        )
+    if not has_typevariable(tp):
+        return isinstance(instance, tp)
+
+    origin = get_origin(tp)
+    args = get_args(tp)
+    if origin in (typing.Union, types.UnionType):
+        for arg in args:
+            candidate = bindings.copy()
+            if instance_match(arg, instance, candidate):
+                bindings.update(candidate)
+                return True
+        return False
+    if not isinstance(origin, type) or not isinstance(instance, origin):
+        return False
+    if not args:
+        return True
+
+    if origin is tuple:
+        if ... in args:
+            return len(args) == 2 and all(
+                instance_match(args[0], item, bindings) for item in instance
+            )
+        if len(instance) != len(args):
+            return False
+        return all(
+            instance_match(arg, item, bindings) for arg, item in zip(args, instance)
+        )
+    if issubclass(origin, Mapping):
+        if not instance:
+            return True
+        key, value = next(iter(instance.items()))
+        return (
+            len(args) == 2
+            and instance_match(args[0], key, bindings)
+            and instance_match(args[1], value, bindings)
+        )
+    if issubclass(origin, Iterable):
+        if isinstance(instance, Iterator):
+            return False
+        if not instance:
+            return True
+        item = next(iter(instance))
+        return len(args) == 1 and instance_match(args[0], item, bindings)
+    return isinstance(instance, tp)
+
+
+def type_shape(value):
+    """Return the runtime type shape used by subscripted dispatch cache keys."""
+    tp = type(value)
+    if isinstance(value, type):
+        return tp
+    if issubclass(tp, tuple):
+        return (tp, *map(type_shape, value))
+    if isinstance(value, Mapping):
+        if not value:
+            return (tp, ())
+        key, item = next(iter(value.items()))
+        return tp, type_shape(key), type_shape(item)
+    if isinstance(value, (str, bytes)):
+        return tp
+    if isinstance(value, Iterable) and not isinstance(value, Iterator):
+        if not value:
+            return tp, ()
+        return tp, type_shape(next(iter(value)))
+    return tp
+
+
+def resolve_type(tp, bindings: dict[TypeVar, type]):
+    if isinstance(tp, typevariable):
+        return bindings.get(tp.__typevar__, tp)
+    args = tuple(resolve_type(arg, bindings) for arg in get_args(tp))
+    origin = get_origin(tp)
+    if origin is None or not args:
+        return tp
+    return (origin, args)
+
+
+def resolved_issubclass(sub, sup) -> bool:
+    if sub is ... or sup is ...:
+        return sub is sup
+    if isinstance(sub, typevariable):
+        sub = subtype(sub.__typevar__.__bound__ or object)
+    if isinstance(sup, typevariable):
+        sup = subtype(sup.__typevar__.__bound__ or object)
+    if isinstance(sub, type) and isinstance(sup, type):
+        return issubclass(sub, sup)
+    if not isinstance(sub, tuple) or not isinstance(sup, tuple):
+        if isinstance(sup, type):
+            sub = sub[0] if isinstance(sub, tuple) else sub
+            return isinstance(sub, type) and issubclass(sub, sup)
+        return False
+
+    sub_origin, sub_args = sub
+    sup_origin, sup_args = sup
+    if not issubclass(sub_origin, sup_origin):
+        return False
+    if not sup_args:
+        return True
+    if sup_origin is tuple and ... in sup_args:
+        return all(arg is ... or resolved_issubclass(arg, sup_args[0]) for arg in sub_args)
+    if len(sub_args) != len(sup_args):
+        return False
+    return all(map(resolved_issubclass, sub_args, sup_args))
+
+
+subtype.origins.register(typevariable, lambda cls: (object,))
+
+
 class signature(tuple):
     """A tuple of types that supports partial ordering."""
 
@@ -221,6 +467,10 @@ class signature(tuple):
 
     def __init__(self, types: Iterable, required: int | None = None):
         self.required = len(self) if required is None else required
+
+    @property
+    def generic(self) -> bool:
+        return any(map(has_typevariable, self))
 
     @classmethod
     def from_hints(cls, func: Callable) -> Self:
@@ -240,7 +490,13 @@ class signature(tuple):
 
     def subtypes(self, *other) -> bool:
         """Return whether all types are subclasses."""
-        return self.required <= len(other) and all(map(issubclass, other, self))
+        if self.required > len(other):
+            return False
+        bindings = {}
+        return all(
+            pattern_issubclass(subtype(sub), candidate, bindings)
+            for sub, candidate in zip(other, self)
+        )
 
     def callable(self, *types) -> bool:
         """Check positional arity of associated function signature."""
@@ -251,10 +507,62 @@ class signature(tuple):
 
     def instances(self, *args) -> bool:
         """Return whether all arguments are instances."""
-        return self.required <= len(args) and all(map(isinstance, args, self))
+        return self.bind(*args) is not None
+
+    def bind(self, *args) -> dict[TypeVar, type] | None:
+        """Return a local TypeVar binding for the arguments when this signature matches."""
+        if self.required > len(args):
+            return None
+        if not any(map(has_typevariable, self)):
+            return {} if all(map(isinstance, args, self)) else None
+        variables = set()
+        for candidate in self:
+            typevariables_in(candidate, variables)
+        bindings = {variable: None for variable in variables}
+        if all(
+            instance_match(candidate, arg, bindings)
+            for candidate, arg in zip(self, args)
+        ):
+            return bindings
+        return None
+
+    def dominates(self, other: "signature", bindings: dict, other_bindings: dict) -> bool:
+        if self is other:
+            return False
+        if len(self) < len(other):
+            return False
+        if self and not other:
+            return True
+        this_side = True
+        other_side = True
+        for this_type, other_type in zip(self, other):
+            this_type = resolve_type(this_type, bindings)
+            other_type = resolve_type(other_type, other_bindings)
+            this_side &= resolved_issubclass(this_type, other_type)
+            other_side &= resolved_issubclass(other_type, this_type)
+        if not this_side:
+            return False
+        if not other_side:
+            return True
+        if not self.generic and other.generic:
+            return True
+        if self.generic and other.generic:
+            bindings = {}
+            this_specific = all(
+                pattern_issubclass(this_type, other_type, bindings)
+                for this_type, other_type in zip(self, other)
+            )
+            bindings = {}
+            other_specific = all(
+                pattern_issubclass(other_type, this_type, bindings)
+                for other_type, this_type in zip(other, self)
+            )
+            return this_specific and not other_specific
+        return False
 
 
 REGISTERED = TypeVar("REGISTERED", bound=Callable[..., Any])
+dispatch_cache_key = object()
 
 
 class multimethod(dict):
@@ -369,9 +677,44 @@ class multimethod(dict):
         types = tuple(map(type, args))
         if not any(map(issubclass, types, self.generics)):
             return self[types]
-        matches = {key for key in list(self) if isinstance(key, signature) and key.instances(*args)}
-        matches -= {ancestor for match in matches for ancestor in match.parents}
-        return self.select(types, matches)
+        if any(
+            isinstance(key, signature) and key.generic
+            for key in list(self)
+        ):
+            cache_key = (dispatch_cache_key, *map(type_shape, args))
+            cached = self.get(cache_key)
+            if cached is not None:
+                return cached
+        else:
+            cache_key = None
+        matches = {
+            key: key.bind(*args)
+            for key in list(self)
+            if isinstance(key, signature) and key.callable(*types)
+        }
+        matches = {key: bindings for key, bindings in matches.items() if bindings is not None}
+        candidates = set(matches)
+        concrete = {match for match in matches if not match.generic and match}
+        for ancestor in {
+            ancestor
+            for match in concrete
+            for ancestor in match.parents
+            if ancestor in concrete
+        }:
+            candidates.discard(ancestor)
+        if any(key.generic for key in matches):
+            candidates -= {
+                other
+                for key in matches
+                for other in matches
+                if key.generic or other.generic
+                if key.dominates(other, matches[key], matches[other])
+            }
+        func = self.select(types, candidates)
+        if any(key.generic for key in candidates):
+            cache_key = (dispatch_cache_key, *map(type_shape, args))
+            super().__setitem__(cache_key, func)
+        return func
 
     def __call__(self, *args, **kwargs):
         """Resolve and dispatch to best method."""
