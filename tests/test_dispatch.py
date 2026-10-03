@@ -3,7 +3,7 @@ from concurrent import futures
 
 import pytest
 
-from multimethod import DispatchError, multidispatch, multimethod, signature
+from multimethod import DispatchError, DispatchKey, multidispatch, multimethod, signature
 
 
 def test_signature():
@@ -120,6 +120,116 @@ def test_keywords():
 
     assert func(0) is func(arg=0) is int
     assert func(0, 0.0) is func(arg=0, extra=0.0) is float
+
+
+def test_bound_keyword_dispatch():
+    @multimethod
+    def func(value: int, mode: str):
+        return "int-str"
+
+    @multimethod
+    def func(value: str, mode: int):
+        return "str-int"
+
+    assert func(1, "x") == func(value=1, mode="x") == "int-str"
+    assert func("x", 1) == func(value="x", mode=1) == "str-int"
+
+
+def test_bound_defaults_and_keyword_only():
+    @multimethod
+    def func(value: int, mode: str = "a"):
+        return "default-mode"
+
+    @multimethod
+    def func(value: int, mode: str = "b", *, flag: bool):
+        return "keyword-only"
+
+    assert func(1) is func(value=1) == "default-mode"
+    assert func(1, flag=True) is func(value=1, flag=True) == "keyword-only"
+    assert func(1, "x", flag=False) is func(value=1, mode="x", flag=False) == "keyword-only"
+    assert func(1, "x") is func(value=1, mode="x") == "default-mode"
+
+    @multimethod
+    def ambiguous(value: int, mode: str = "a"):
+        return "a"
+
+    @multimethod
+    def ambiguous(value: int, mode: str = "b"):
+        return "b"
+
+    with pytest.raises(DispatchError, match="2 methods"):
+        ambiguous(1)
+
+    @multimethod
+    def valid_default(value: int, mode: str = "x"):
+        return mode
+
+    @valid_default.register
+    def _(value: int, mode: str = 1):
+        return mode
+
+    assert valid_default(1) == "x"
+
+
+def test_bound_varargs():
+    @multimethod
+    def func(value: int, *extra: float):
+        return "floats"
+
+    @multimethod
+    def func(value: int, *extra: str, **options: bool):
+        return "strings"
+
+    assert func(1, 2.0, 3.0) == "floats"
+    assert func(1, "x", "y", option=True) == "strings"
+
+
+def test_bound_dispatch_ambiguity_and_cache_shape():
+    @multimethod
+    def func(value: int, mode: int, /):
+        return "positional-only"
+
+    @multimethod
+    def func(value: int, *, mode: int):
+        return "keyword-only"
+
+    assert func(1, 2) == "positional-only"
+    assert func(value=1, mode=2) == "keyword-only"
+    assert func(mode=2, value=1) == "keyword-only"
+    assert func(1, 2) == "positional-only"
+    cached = [key for key in func if isinstance(key, DispatchKey)]
+    assert len(cached) == 2
+
+    @multimethod
+    def other(value: int, mode: int):
+        return "ordered"
+
+    @multimethod
+    def other(mode: int, value: int):
+        return "reordered"
+
+    with pytest.raises(DispatchError, match="2 methods"):
+        other(1, 2)
+    with pytest.raises(DispatchError, match="2 methods"):
+        other(value=1, mode=2)
+    with pytest.raises(DispatchError):
+        other(mode=2, value=1)
+
+
+def test_function_typeerror_propagates():
+    @multimethod
+    def func(value: int):
+        return [value][1]
+
+    with pytest.raises(IndexError):
+        func(1)
+
+    @multimethod
+    def broken(value: int):
+        raise TypeError("business error")
+
+    with pytest.raises(TypeError, match="business error"):
+        broken(1)
 
 
 def test_concurrency():

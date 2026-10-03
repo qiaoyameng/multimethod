@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
+### Added
+* `multimethod` resolves keyword, keyword-only, default, and variadic arguments with signature-aware binding
+
+### Fixed
+* Equivalent positional and keyword calls use consistent type dispatch
+* Dispatch caches distinguish positional and keyword binding shapes
+* `TypeError` raised inside a selected implementation propagates unchanged
 
 ## [2.1](https://pypi.org/project/multimethod/2.1/) - 2026-07-28
 ### Changed

@@ -1,7 +1,6 @@
 import abc
 import builtins
 import collections
-import contextlib
 import functools
 import inspect
 import itertools
@@ -215,12 +214,69 @@ class signature(tuple):
     required: int
     parents: set
     sig: inspect.Signature
+    named_types: dict[str, type]
+    dispatch_masks: dict[str, bool]
+    match_types: bool
 
     def __new__(cls, types: Iterable, required: int | None = None):
         return tuple.__new__(cls, map(subtype, types))
 
     def __init__(self, types: Iterable, required: int | None = None):
         self.required = len(self) if required is None else required
+        self.named_types = {}
+        self.dispatch_masks = {}
+        self.match_types = True
+
+    def __hash__(self):
+        return tuple.__hash__(self)
+
+    def __eq__(self, other) -> bool:
+        if not tuple.__eq__(self, other):
+            return False
+        return not isinstance(other, signature) or self.dispatch_shape == other.dispatch_shape
+
+    @property
+    def dispatch_shape(self) -> tuple:
+        sig = getattr(self, "sig", None)
+        if sig is None:
+            return ()
+        return tuple(
+            (
+                param.name,
+                param.kind,
+                None if param.default is inspect.Parameter.empty else repr(param.default),
+                self.named_types.get(param.name, object),
+            )
+            for param in sig.parameters.values()
+        )
+
+    @staticmethod
+    def _annotation_type(annotation):
+        return object if annotation is ... else subtype(annotation)
+
+    def set_dispatch_types(self, sig: inspect.Signature, hints: dict[str, Any]):
+        self.sig = sig
+        positional_kinds = {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+        self.named_types = {}
+        self.dispatch_masks = {}
+        index = 0
+        for param in sig.parameters.values():
+            if param.kind in positional_kinds:
+                if index < len(self):
+                    annotation = self[index]
+                    dispatch = True
+                else:
+                    annotation = hints.get(param.name, object)
+                    dispatch = param.name in hints
+                index += 1
+            else:
+                annotation = hints.get(param.name, object)
+                dispatch = param.name in hints
+            self.named_types[param.name] = self._annotation_type(annotation)
+            self.dispatch_masks[param.name] = dispatch
 
     @classmethod
     def from_hints(cls, func: Callable) -> Self:
@@ -228,15 +284,26 @@ class signature(tuple):
         if not hasattr(func, "__annotations__"):
             return cls(())
         type_hints = get_type_hints(func)
+        sig = inspect.signature(func)
         positionals = {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
-        params: Iterable = inspect.signature(func).parameters.values()
+        params: Iterable = sig.parameters.values()
         params = [param for param in params if param.kind in positionals]
         # missing annotations are padded with `object`, but trailing objects are unnecessary
         indices = [index for index, param in enumerate(params) if param.name in type_hints]
         params = params[: max(indices, default=-1) + 1]
         hints = [type_hints.get(param.name, object) for param in params]
         required = sum(param.default is param.empty for param in params)
-        return cls(hints, required)
+        result = cls(hints, required)
+        dispatch_masks = {
+            param.name: param.name in type_hints
+            for param in sig.parameters.values()
+        }
+        result.dispatch_masks = dispatch_masks
+        result.named_types = {
+            param.name: cls._annotation_type(type_hints.get(param.name, object))
+            for param in sig.parameters.values()
+        }
+        return result
 
     def subtypes(self, *other) -> bool:
         """Return whether all types are subclasses."""
@@ -244,6 +311,8 @@ class signature(tuple):
 
     def callable(self, *types) -> bool:
         """Check positional arity of associated function signature."""
+        if any(isinstance(tp, DispatchKey) for tp in types):
+            return True
         try:
             return not hasattr(self, "sig") or bool(self.sig.bind_partial(*types))
         except TypeError:
@@ -253,8 +322,120 @@ class signature(tuple):
         """Return whether all arguments are instances."""
         return self.required <= len(args) and all(map(isinstance, args, self))
 
+    def bind(self, *args, **kwargs) -> tuple[inspect.BoundArguments, set[str]] | None:
+        """Bind arguments and check all values, including defaults and variadics."""
+        sig = getattr(self, "sig", None)
+        if sig is None:
+            return None
+        try:
+            bound = sig.bind(*args, **kwargs)
+        except TypeError:
+            return None
+        supplied = set(bound.arguments)
+        bound.apply_defaults()
+        if not self.bound_instances(bound, supplied):
+            return None
+        return bound, supplied
+
+    def bound_instances(self, bound: inspect.BoundArguments, supplied: set[str]) -> bool:
+        if not self.match_types:
+            return True
+        for name, param in self.sig.parameters.items():
+            if not self.dispatch_masks.get(name, False):
+                continue
+            tp = self.named_types.get(name, object)
+            value = bound.arguments[name]
+            if param.kind is inspect.Parameter.VAR_POSITIONAL:
+                values = value
+            elif param.kind is inspect.Parameter.VAR_KEYWORD:
+                values = value.values()
+            else:
+                if not isinstance(value, tp):
+                    return False
+                continue
+            if param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
+                if not all(isinstance(item, tp) for item in values):
+                    return False
+        return True
+
+    def dispatch_slots(
+        self, bound: inspect.BoundArguments
+    ) -> tuple[dict, dict]:
+        positional = {}
+        keywords = {}
+        parameters = list(self.sig.parameters.values())
+        fixed = [
+            param
+            for param in parameters
+            if param.kind
+            in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+        ]
+        var_positional = next(
+            (param for param in parameters if param.kind is inspect.Parameter.VAR_POSITIONAL),
+            None,
+        )
+        var_keyword = next(
+            (param for param in parameters if param.kind is inspect.Parameter.VAR_KEYWORD),
+            None,
+        )
+        for index, param in enumerate(fixed):
+            if self.dispatch_masks.get(param.name, False):
+                positional[index] = (2, self.named_types[param.name])
+        if var_positional is not None:
+            var_args = bound.arguments[var_positional.name]
+            if var_args and self.dispatch_masks.get(var_positional.name, True):
+                for offset in range(len(var_args)):
+                    positional[len(fixed) + offset] = (1, self.named_types[var_positional.name])
+        for param in parameters:
+            if param.kind is inspect.Parameter.KEYWORD_ONLY and self.dispatch_masks.get(
+                param.name, False
+            ):
+                keywords[param.name] = (2, self.named_types[param.name])
+        if var_keyword is not None and self.dispatch_masks.get(var_keyword.name, True):
+            for name in bound.arguments[var_keyword.name]:
+                keywords[name] = (1, self.named_types[var_keyword.name])
+        return positional, keywords
+
+    def more_specific(
+        self,
+        other: "signature",
+        binding,
+        other_binding,
+    ) -> bool:
+        bound, _ = binding
+        other_bound, _ = other_binding
+        groups = zip(
+            self.dispatch_slots(bound),
+            other.dispatch_slots(other_bound),
+            strict=True,
+        )
+        comparable = False
+        for own_slots, other_slots in groups:
+            for name in own_slots.keys() | other_slots.keys():
+                own_rank, own_type = own_slots.get(name, (0, object))
+                other_rank, other_type = other_slots.get(name, (0, object))
+                if own_rank < other_rank or (
+                    own_rank == other_rank and not issubclass(own_type, other_type)
+                ):
+                    return False
+                comparable |= own_rank > other_rank or (
+                    own_rank == other_rank and own_type is not other_type
+                )
+        return comparable
+
 
 REGISTERED = TypeVar("REGISTERED", bound=Callable[..., Any])
+
+
+class DispatchKey(tuple):
+    """A cache key which distinguishes call shapes from registered type tuples."""
+
+    __slots__ = ()
+
+    __hash__ = tuple.__hash__
+
+    def __eq__(self, other) -> bool:
+        return type(self) is type(other) and tuple.__eq__(self, other)
 
 
 class multimethod(dict):
@@ -263,6 +444,9 @@ class multimethod(dict):
     __name__: str
     pending: set
     generics: list[tuple]  # positional bases which require instance checks
+    bound_dispatch: bool
+    dispatch_origins: set[type]
+    validate_positional: bool
 
     def __new__(cls, func):
         homonym = inspect.currentframe().f_back.f_locals.get(func.__name__)
@@ -272,6 +456,9 @@ class multimethod(dict):
         self = functools.update_wrapper(dict.__new__(cls), func)
         self.pending = set()
         self.generics = []
+        self.bound_dispatch = False
+        self.dispatch_origins = set()
+        self.validate_positional = False
         return self
 
     def __init__(self, func: Callable):
@@ -319,9 +506,22 @@ class multimethod(dict):
         self.clean()
         if not isinstance(types, signature):
             types = signature(types)
+        try:
+            sig = inspect.signature(func)
+            hints = get_type_hints(func)
+        except (ValueError, NameError, AttributeError):
+            pass
+        else:
+            types.set_dispatch_types(sig, hints)
+        if isinstance(self, multidispatch) and len(types) == 0:
+            types.match_types = False
         parents = types.parents = self.parents(types)
-        with contextlib.suppress(ValueError):
-            types.sig = inspect.signature(func)
+        if any(
+            tuple.__eq__(existing, types)
+            for existing in self
+            if isinstance(existing, signature)
+        ):
+            self.bound_dispatch = True
         self.pop(types, None)  # ensure key is overwritten
         for key in self:
             if types.subtypes(*key) and (not parents or parents & key.parents):
@@ -331,6 +531,42 @@ class multimethod(dict):
             if origins := set(subtype.origins(cls)):
                 self.generics += [()] * (index + 1 - len(self.generics))
                 self.generics[index] = tuple(origins.union(self.generics[index]))
+        for cls in types.named_types.values():
+            self.dispatch_origins.update(subtype.origins(cls))
+        sig = getattr(types, "sig", None)
+        if sig is not None and any(
+            param.kind
+            in {
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }
+            or (
+                param.kind
+                in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                }
+                and param.default is not inspect.Parameter.empty
+            )
+            for param in sig.parameters.values()
+        ):
+            self.bound_dispatch = True
+        positional_kinds = {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+        required_positional = (
+            sum(
+                param.default is inspect.Parameter.empty
+                and param.kind in positional_kinds
+                for param in sig.parameters.values()
+            )
+            if sig is not None
+            else 0
+        )
+        if required_positional > types.required:
+            self.validate_positional = True
         super().__setitem__(types, func)
         self.__doc__ = self.docstring
 
@@ -364,8 +600,84 @@ class multimethod(dict):
             return self[types]
         return self.setdefault(types, self.select(types, self.parents(types)))
 
-    def dispatch(self, *args) -> Callable:
+    @staticmethod
+    def dispatch_key(args: tuple, kwargs: dict[str, Any]) -> tuple:
+        return DispatchKey((
+            tuple(map(type, args)),
+            DispatchKey(sorted((name, type(value)) for name, value in kwargs.items())),
+        ))
+
+    def uses_instance_checks(self, args: tuple, kwargs: dict[str, Any]) -> bool:
+        values = itertools.chain(args, kwargs.values())
+        return any(
+            isinstance(value, origin)
+            for value in values
+            for origin in self.dispatch_origins
+        )
+
+    def filter_bound(self, candidates: dict[signature, tuple]) -> set[signature]:
+        matches = set(candidates)
+        for candidate in candidates:
+            if any(
+                other is not candidate
+                and other.more_specific(candidate, candidates[other], candidates[candidate])
+                for other in candidates
+            ):
+                matches.discard(candidate)
+        return matches
+
+    def bound_uses_instance_checks(self, candidates: dict[signature, tuple]) -> bool:
+        for key, (bound, supplied) in candidates.items():
+            for name, param in key.sig.parameters.items():
+                if name in supplied or not key.dispatch_masks.get(name, False):
+                    continue
+                value = bound.arguments[name]
+                values = (
+                    value
+                    if param.kind is inspect.Parameter.VAR_POSITIONAL
+                    else value.values()
+                    if param.kind is inspect.Parameter.VAR_KEYWORD
+                    else (value,)
+                )
+                origins = set(subtype.origins(key.named_types[name]))
+                if any(isinstance(item, origin) for item in values for origin in origins):
+                    return True
+        return False
+
+    def dispatch(self, *args, **kwargs) -> Callable:
         self.evaluate()
+        if kwargs or self.bound_dispatch:
+            key = self.dispatch_key(args, kwargs)
+            func = dict.get(self, key)
+            if func is None:
+                candidates = {}
+                for sig in list(self):
+                    if not isinstance(sig, signature):
+                        continue
+                    binding = sig.bind(*args, **kwargs)
+                    if binding is not None:
+                        candidates[sig] = binding
+                if not candidates:
+                    raise DispatchError(f"{self.__name__}: 0 methods found", key, set())
+                if isinstance(self, multidispatch):
+                    fallback = {
+                        sig: binding
+                        for sig, binding in candidates.items()
+                        if not getattr(sig, "match_types", True)
+                    }
+                    specific = dict(candidates)
+                    for sig in fallback:
+                        del specific[sig]
+                    if specific:
+                        candidates = specific
+                matches = self.filter_bound(candidates)
+                if self.uses_instance_checks(args, kwargs) or (
+                    self.bound_uses_instance_checks(candidates)
+                ):
+                    return self.select(key, matches)
+                dict.setdefault(self, key, self.select(key, matches))
+                func = dict.get(self, key)
+            return func
         types = tuple(map(type, args))
         if not any(map(issubclass, types, self.generics)):
             return self[types]
@@ -375,11 +687,13 @@ class multimethod(dict):
 
     def __call__(self, *args, **kwargs):
         """Resolve and dispatch to best method."""
-        func = self.dispatch(*args)
-        try:
-            return func(*args, **kwargs)
-        except TypeError as ex:
-            raise DispatchError(f"Function {func.__code__}") from ex
+        func = self.dispatch(*args, **kwargs)
+        if not kwargs and not self.bound_dispatch and self.validate_positional:
+            try:
+                inspect.signature(func).bind(*args, **kwargs)
+            except TypeError as ex:
+                raise DispatchError(f"Function {getattr(func, '__code__', func)}") from ex
+        return func(*args, **kwargs)
 
     def evaluate(self):
         """Evaluate any pending forward references."""
@@ -405,10 +719,8 @@ class multidispatch(multimethod, dict[tuple[type, ...], Callable[..., RETURN]]):
     """Wrapper for compatibility with `functools.singledispatch`.
 
     Only uses the `register` method instead of namespace lookup.
-    Allows dispatching on keyword arguments based on the first function signature.
+    Allows dispatching on bound positional and keyword arguments.
     """
-
-    signatures: dict[tuple, inspect.Signature]
 
     def __new__(cls, func: Callable[..., RETURN]) -> "multidispatch[RETURN]":
         return functools.update_wrapper(dict.__new__(cls), func)  # type: ignore
@@ -416,28 +728,16 @@ class multidispatch(multimethod, dict[tuple[type, ...], Callable[..., RETURN]]):
     def __init__(self, func: Callable[..., RETURN]) -> None:
         self.pending = set()
         self.generics = []
-        self.signatures = {}
+        self.bound_dispatch = True
+        self.dispatch_origins = set()
+        self.validate_positional = False
         self[()] = func
 
     def __get__(self, instance, owner) -> Callable[..., RETURN]:
         return self if instance is None else types.MethodType(self, instance)
 
-    def __setitem__(self, types: tuple, func: Callable):
-        super().__setitem__(types, func)
-        with contextlib.suppress(ValueError):
-            signature = inspect.signature(func)
-            self.signatures.setdefault(tuple(signature.parameters), signature)
-
     def __call__(self, *args: Any, **kwargs: Any) -> RETURN:
-        """Resolve and dispatch to best method."""
-        params = args
-        if kwargs:
-            for signature in self.signatures.values():  # pragma: no branch
-                with contextlib.suppress(TypeError):
-                    params = signature.bind(*args, **kwargs).args
-                    break
-        func = self.dispatch(*params)
-        return func(*args, **kwargs)
+        return super().__call__(*args, **kwargs)
 
 
 class multimeta(type):

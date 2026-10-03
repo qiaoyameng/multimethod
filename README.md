@@ -18,8 +18,8 @@ There are a couple options which trade-off dispatch speed for flexibility.
 
 Decorator | Speed | Dispatch | Arguments
 --------- | ----- | -------- | ---------
-[multimethod](#multimethod) | faster | cached lookup | positional only
-[multidispatch](#multidispatch) | slower | binds to first signature + cached lookup | positional + keywords
+[multimethod](#multimethod) | faster | cached lookup | positional + keywords
+[multidispatch](#multidispatch) | slower | cached binding lookup | positional + keywords
 
 Dispatching on simple types which use `issubclass` is cached. Advanced types which use `isinstance` require a linear scan.
 
@@ -72,12 +72,14 @@ Naturally checking subscripts is slower, but the implementation is optimized, ca
 Dispatch resolution details:
 * If an exact match isn't registered, the next closest method is called (and cached).
 * If there are ambiguous methods - or none - a custom `TypeError` is raised.
-* Keyword-only parameters may be annotated, but won't affect dispatching.
+* Parameter binding supports positional-only, keyword-only, default, and variadic parameters.
+* Equivalent positional and keyword calls resolve the same overloads when the signature allows both forms.
+* Calls with different binding shapes are cached separately, independent of keyword traversal order.
 * A skipped annotation is equivalent to `: object`.
 * If no types are specified, it will inherently match all arguments.
 
 ### multidispatch
-`multidispatch` is a wrapper to provide compatibility with `functools.singledispatch`. It requires a base implementation and use of the `register` method instead of namespace lookup. It also supports dispatching on keyword arguments.
+`multidispatch` is a wrapper to provide compatibility with `functools.singledispatch`. It requires a base implementation and use of the `register` method instead of namespace lookup. The base implementation remains the untyped fallback while registered overloads use the same binding-aware dispatch.
 
 ### instance checks
 `subtype` provisionally provides `isinstance` and `issubclass` checks for generic types. When called on a non-generic, it will return the origin type.

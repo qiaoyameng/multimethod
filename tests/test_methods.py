@@ -258,7 +258,7 @@ def test_dispatch_exception():
     with pytest.raises(DispatchError, match="test_methods.py"):
         # invalid number of args, check source file is part of the exception args
         temp(1)
-    assert temp(1, y=1.0) == "int"
+    assert temp(1, y=1.0) == temp(1, 1.0) == "int, float"
     assert temp(True) == "bool"
     assert temp(True, 1.0) == "int, float"
 
