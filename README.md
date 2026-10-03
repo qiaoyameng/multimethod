@@ -79,6 +79,48 @@ Dispatch resolution details:
 ### multidispatch
 `multidispatch` is a wrapper to provide compatibility with `functools.singledispatch`. It requires a base implementation and use of the `register` method instead of namespace lookup. It also supports dispatching on keyword arguments.
 
+### combined
+`combined` is an opt-in `multimethod` with explicit method combination. Methods are registered with one of four qualifiers, and all applicable methods form a chain ordered by specificity:
+
+```python
+from multimethod import combined, next_method
+
+
+@combined
+def func(x: object):
+    return "object"
+
+
+@func.primary  # same as `register`
+def _(x: int):
+    return next_method() + "+int"
+
+
+@func.before
+def _(x: int):
+    print("validate")
+
+
+@func.after
+def _(x: int):
+    print("audit")
+
+
+@func.around
+def _(x: int):
+    return "[" + next_method() + "]"
+
+
+func(0)  # validate, [object+int], audit
+```
+
+* `around` methods run most specific first, and may short-circuit or delegate to the rest of the chain via `next_method`.
+* `before` methods run from most to least specific; `after` methods run from least to most specific, and only if the primary method returned normally. Their return values are ignored.
+* The most specific `primary` method runs, and may delegate to the next less specific one via `next_method`.
+* `next_method` is bound to the candidate snapshot of the current call: it takes no arguments, may be called multiple times, and raises `DispatchError` if there is no next method.
+* All applicable methods of a qualifier must be totally ordered by specificity; incomparable candidates raise `DispatchError`.
+* Exceptions raised inside methods propagate unchanged, and reentrant calls get their own chain.
+
 ### instance checks
 `subtype` provisionally provides `isinstance` and `issubclass` checks for generic types. When called on a non-generic, it will return the origin type.
 

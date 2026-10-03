@@ -2,6 +2,7 @@ import abc
 import builtins
 import collections
 import contextlib
+import contextvars
 import functools
 import inspect
 import itertools
@@ -438,6 +439,205 @@ class multidispatch(multimethod, dict[tuple[type, ...], Callable[..., RETURN]]):
                     break
         func = self.dispatch(*params)
         return func(*args, **kwargs)
+
+
+_next_method: contextvars.ContextVar = contextvars.ContextVar("next_method", default=None)
+
+
+def next_method():
+    """Call the next method in the current `combined` chain.
+
+    The next method is bound to the candidate snapshot of the current call,
+    and is invoked with the same arguments; it takes no arguments here.
+    It may be called multiple times, re-invoking the same next method.
+    Raises `DispatchError` if there is no next method.
+    """
+    method = _next_method.get()
+    if method is None:
+        raise DispatchError("next_method: no next method")
+    return method()
+
+
+class qualified(multimethod):
+    """A multimethod which cleans its owner's chain cache when updated."""
+
+    owner: "combined"
+
+    def __setitem__(self, types: tuple, func: Callable):
+        super().__setitem__(types, func)
+        self.owner.clean()
+
+    def __delitem__(self, types: tuple):
+        super().__delitem__(types)
+        self.owner.clean()
+
+
+class combined(multimethod):
+    """A multimethod with explicit method combination.
+
+    Methods are registered with one of four qualifiers:
+
+    * `primary` (or `register`): the main methods. The most specific one runs,
+      and may delegate to the next less specific one via `next_method`.
+    * `before`: run before the primary method, from most to least specific.
+    * `after`: run after the primary method returns normally, from least to
+      most specific. Skipped if an exception unwinds the chain.
+    * `around`: wrap the whole chain, from most to least specific. Each may
+      short-circuit or delegate to the rest of the chain via `next_method`.
+
+    All applicable methods of a qualifier must be totally ordered by
+    specificity; incomparable candidates raise `DispatchError`.
+    `next_method` is bound to the candidate snapshot of the current call,
+    and exceptions raised inside methods propagate unchanged.
+    """
+
+    cache: dict
+    befores: qualified
+    afters: qualified
+    arounds: qualified
+
+    def __init__(self, func: Callable):
+        if not hasattr(self, "cache"):
+            self.cache = {}
+            self.befores = self.qualifier("befores")
+            self.afters = self.qualifier("afters")
+            self.arounds = self.qualifier("arounds")
+        super().__init__(func)
+
+    def qualifier(self, name: str) -> qualified:
+        """Return a new empty qualifier multimethod owned by this one."""
+        methods = dict.__new__(qualified)
+        methods.owner = self
+        methods.pending = set()
+        methods.generics = []
+        methods.__name__ = f"{self.__name__}.{name}"
+        return methods
+
+    def primary(self, *args) -> Callable:
+        """Decorator for registering a primary method, same as `register`."""
+        return self.register(*args)
+
+    def before(self, *args) -> Callable:
+        """Decorator for registering a before method."""
+        return self.befores.register(*args)
+
+    def after(self, *args) -> Callable:
+        """Decorator for registering an after method."""
+        return self.afters.register(*args)
+
+    def around(self, *args) -> Callable:
+        """Decorator for registering an around method."""
+        return self.arounds.register(*args)
+
+    def clean(self):
+        """Empty the chain cache."""
+        super().clean()
+        self.cache.clear()
+
+    def evaluate(self):
+        """Evaluate any pending forward references."""
+        super().evaluate()
+        self.befores.evaluate()
+        self.afters.evaluate()
+        self.arounds.evaluate()
+
+    def copy(self):
+        """Return a new `combined` with the same methods."""
+        other = dict.__new__(type(self)).__ior__(self)
+        other.__name__ = self.__name__
+        other.pending = set(self.pending)
+        other.generics = list(self.generics)
+        other.cache = {}
+        for name in ("befores", "afters", "arounds"):
+            methods = getattr(self, name)
+            replica = other.qualifier(name)
+            dict.__ior__(replica, methods)
+            replica.pending = set(methods.pending)
+            replica.generics = list(methods.generics)
+            setattr(other, name, replica)
+        return other
+
+    def __missing__(self, types: tuple):
+        """Primary methods are stored exactly; chains are computed by `chain`."""
+        raise KeyError(types)
+
+    def applicable(self, methods: multimethod, types: tuple, args: tuple | None = None) -> tuple:
+        """Return applicable methods of given types, from most to least specific."""
+        if args is None:
+            keys = {key for key in methods if isinstance(key, signature) and key.subtypes(*types)}
+        else:
+            keys = {key for key in methods if isinstance(key, signature) and key.instances(*args)}
+        keys = {key for key in keys if key.callable(*types)}
+        ordered = []
+        while keys:
+            most = {
+                key
+                for key in keys
+                if not any(key.subtypes(*other) for other in keys if other is not key)
+            }
+            if len(most) != 1:
+                funcs = {key: methods[key] for key in most}
+                msg = f"{self.__name__}: {len(funcs)} methods found"
+                raise DispatchError(msg, types, set(funcs))
+            (key,) = most
+            ordered.append(methods[key])
+            keys.discard(key)
+        return tuple(ordered)
+
+    def compute(self, types: tuple, args: tuple | None = None) -> tuple:
+        """Return the candidate snapshot for given types: (arounds, befores, primaries, afters)."""
+        return (
+            self.applicable(self.arounds, types, args),
+            self.applicable(self.befores, types, args),
+            self.applicable(self, types, args),
+            self.applicable(self.afters, types, args),
+        )
+
+    def chain(self, *args) -> tuple:
+        """Return the candidate snapshot for the given arguments."""
+        self.evaluate()
+        types = tuple(map(type, args))
+        methods = (self, self.befores, self.afters, self.arounds)
+        if any(any(map(issubclass, types, method.generics)) for method in methods):
+            return self.compute(tuple(map(subtype, types)), args)
+        key = tuple(map(subtype, types))
+        try:
+            return self.cache[key]
+        except KeyError:
+            return self.cache.setdefault(key, self.compute(key))
+
+    def __call__(self, *args, **kwargs):
+        """Resolve and dispatch to the combined method chain."""
+        arounds, befores, primaries, afters = self.chain(*args)
+
+        def run(func, continuation):
+            token = _next_method.set(continuation)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                _next_method.reset(token)
+
+        def run_primary(index):
+            continuation = (lambda: run_primary(index + 1)) if index + 1 < len(primaries) else None
+            return run(primaries[index], continuation)
+
+        def run_around(index):
+            continuation = (lambda: run_around(index + 1)) if index + 1 < len(arounds) else body
+            return run(arounds[index], continuation)
+
+        def body():
+            if not primaries:
+                raise DispatchError(
+                    f"{self.__name__}: 0 methods found", tuple(map(type, args)), set()
+                )
+            for func in befores:
+                run(func, None)
+            result = run_primary(0)
+            for func in reversed(afters):
+                run(func, None)
+            return result
+
+        return run_around(0) if arounds else body()
 
 
 class multimeta(type):
