@@ -123,7 +123,7 @@ class Cls:
     meth = classmethod(meth)  # done with registering
 ```
 
-If a method spans multiple classes, then the namespace lookup can not work. The `register` method can be used instead.
+Multimethods are inherited by subclasses, and may be extended with additional overloads. Each subclass gets its own registry: base classes and sibling classes are unaffected.
 
 ```python
 class Base:
@@ -132,16 +132,18 @@ class Base:
 
 
 class Subclass(Base):
-    @Base.meth.register
-    def _(self, arg: int): ...
+    @multimethod
+    def meth(self, arg: int): ...  # inherits the `str` overload
 ```
 
-If the base class can not be modified, the decorator - like any - can be called explicitly.
+An identical signature overrides the inherited one. With multiple inheritance, overloads are merged following the MRO: each ancestor is collected once, and on conflicting identical signatures the class nearest in the MRO wins.
+
+Inheritance is a snapshot: a subclass registry is finalized when the subclass is defined, or when first accessed if it defines no overloads. Methods registered on a base class afterwards are not propagated to its subclasses, and each registry maintains an independent dispatch cache. Registering on the base class explicitly remains available when a shared registry is intended.
 
 ```python
 class Subclass(Base):
-    meth = multimethod(Base.meth)
-    ...
+    @Base.meth.register  # registers on `Base`, visible to all subclasses
+    def _(self, arg: int): ...
 ```
 
 `multimeta` creates a class with a special namespace which converts callables to multimethods, and registers duplicate callables with the original.

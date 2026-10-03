@@ -296,7 +296,31 @@ class multimethod(dict):
             return self if self.__name__ == args[0].__name__ else args[0]
         return lambda func: self.__setitem__(args, func) or func
 
+    def __set_name__(self, owner, name):
+        """Inherit methods from homonymous multimethods in base classes.
+
+        Bases are searched in MRO order, so nearer classes take precedence on
+        identical signatures; each ancestor contributes only methods not already
+        registered. The inherited registries are copied, never shared.
+        """
+        for base in owner.__mro__[1:]:
+            inherited = base.__dict__.get(name)
+            if isinstance(inherited, multimethod):
+                self.inherit(inherited)
+
     def __get__(self, instance, owner):
+        if owner is not None and self.__name__ not in owner.__dict__:
+            for cls in owner.__mro__:
+                if self.__name__ in cls.__dict__:
+                    if cls.__dict__[self.__name__] is self:
+                        # nearest homonym: materialize a registry owned by `owner`
+                        self = self.copy()
+                        for base in owner.__mro__:
+                            inherited = base.__dict__.get(self.__name__)
+                            if isinstance(inherited, multimethod):
+                                self.inherit(inherited)
+                        setattr(owner, self.__name__, self)
+                    break
         return self if instance is None else types.MethodType(self, instance)
 
     def parents(self, types: tuple) -> set:
@@ -313,7 +337,32 @@ class multimethod(dict):
 
     def copy(self):
         """Return a new multimethod with the same methods."""
-        return dict.__new__(type(self)).__ior__(self)
+        new = dict.__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        new.pending = set(self.pending)
+        new.generics = []
+        if hasattr(new, "signatures"):
+            new.signatures = dict(new.signatures)
+        for key, func in self.items():
+            if isinstance(key, signature):
+                new[signature(key, key.required)] = func
+            else:
+                dict.__setitem__(new, key, func)
+        return new
+
+    def inherit(self, other: "multimethod") -> Self:
+        """Register methods from another multimethod, keeping existing ones on conflict.
+
+        Only registered signatures are merged, not the dispatch cache; pending
+        forward references are carried over. Keys are copied so the directed
+        acyclic graph of each multimethod remains independent.
+        """
+        self.pending |= other.pending
+        registered = {key for key in self if isinstance(key, signature)}
+        for key, func in other.items():
+            if isinstance(key, signature) and key not in registered:
+                self[signature(key, key.required)] = func
+        return self
 
     def __setitem__(self, types: tuple, func: Callable):
         self.clean()
@@ -420,7 +469,7 @@ class multidispatch(multimethod, dict[tuple[type, ...], Callable[..., RETURN]]):
         self[()] = func
 
     def __get__(self, instance, owner) -> Callable[..., RETURN]:
-        return self if instance is None else types.MethodType(self, instance)
+        return super().__get__(instance, owner)
 
     def __setitem__(self, types: tuple, func: Callable):
         super().__setitem__(types, func)
