@@ -101,9 +101,12 @@ class subtype(abc.ABCMeta):
             case types.UnionType:
                 return issubclass(subclass, self.__args__)
             case builtins.tuple:
-                if issubclass(origin, tuple) and ... in self.__args__:
-                    param = self.__args__[0]
-                    return all(arg is ... or issubclass(arg, param) for arg in args)
+                if issubclass(origin, tuple):
+                    if ... in self.__args__:
+                        param = self.__args__[0]
+                        return all(arg is ... or issubclass(arg, param) for arg in args)
+                    if ... in args:
+                        return False
             case collections.abc.Callable:
                 params = self.__args__[:-1]
                 return (
@@ -209,6 +212,44 @@ class parametric(abc.ABCMeta):
 subtype.origins.register(parametric, lambda cls: cls.__bases__)
 
 
+def _strict_instance(instance, cls, seen: frozenset = frozenset()) -> bool:
+    """Strict `isinstance` check which inspects every element of materialized containers.
+
+    Unlike `subtype.__instancecheck__` - which samples a single element - all relevant
+    elements of finite containers are checked. Iterators and generators are never
+    consumed: they fall back to their plain runtime (origin) type. Recursive containers
+    terminate coinductively: a revisited (instance, type) pair is assumed to match.
+    Empty containers match vacuously, leaving ambiguity resolution to the caller.
+    """
+    if not isinstance(cls, subtype):
+        return isinstance(instance, cls)
+    origin, args = cls.__origin__, cls.__args__
+    if origin is types.UnionType:
+        return any(_strict_instance(instance, arg, seen) for arg in args)
+    if origin in (typing.Literal, builtins.type, typing.NewType, Callable) or not args:
+        return isinstance(instance, cls)
+    if not isinstance(instance, origin):
+        return False
+    if isinstance(instance, Iterator):
+        return True  # fall back to runtime type rather than consume the iterator
+    memo = (id(instance), id(cls))
+    if memo in seen:
+        return True  # coinductive: recursive occurrence assumed to match
+    seen = seen | {memo}
+    if origin is tuple:
+        if ... in args:
+            return all(_strict_instance(arg, args[0], seen) for arg in instance)
+        return len(instance) == len(args) and all(
+            _strict_instance(arg, tp, seen) for arg, tp in zip(instance, args)
+        )
+    if issubclass(cls, Mapping):
+        return all(
+            _strict_instance(key, args[0], seen) and _strict_instance(value, args[1], seen)
+            for key, value in instance.items()
+        )
+    return all(_strict_instance(arg, tp, seen) for arg in instance for tp in args)
+
+
 class signature(tuple):
     """A tuple of types that supports partial ordering."""
 
@@ -253,6 +294,10 @@ class signature(tuple):
         """Return whether all arguments are instances."""
         return self.required <= len(args) and all(map(isinstance, args, self))
 
+    def strict_instances(self, *args) -> bool:
+        """Return whether all arguments match, checking every element of materialized containers."""
+        return self.required <= len(args) and all(map(_strict_instance, args, self))
+
 
 REGISTERED = TypeVar("REGISTERED", bound=Callable[..., Any])
 
@@ -263,6 +308,7 @@ class multimethod(dict):
     __name__: str
     pending: set
     generics: list[tuple]  # positional bases which require instance checks
+    strict = False  # check every element of materialized containers during dispatch
 
     def __new__(cls, func):
         homonym = inspect.currentframe().f_back.f_locals.get(func.__name__)
@@ -369,7 +415,8 @@ class multimethod(dict):
         types = tuple(map(type, args))
         if not any(map(issubclass, types, self.generics)):
             return self[types]
-        matches = {key for key in list(self) if isinstance(key, signature) and key.instances(*args)}
+        instances = signature.strict_instances if self.strict else signature.instances
+        matches = {key for key in list(self) if isinstance(key, signature) and instances(key, *args)}
         matches -= {ancestor for match in matches for ancestor in match.parents}
         return self.select(types, matches)
 

@@ -107,6 +107,20 @@ Coroutine = parametric(Callable, inspect.iscoroutinefunction)
 IntArray = parametric(array, typecode="i")
 ```
 
+### strict containers
+By default, subscripted containers are matched by sampling a single element. Set `strict` on a multimethod to instead check every element of materialized containers (`list`, `tuple`, `dict`, `set`, and nested combinations) during dispatch.
+
+```python
+func.strict = True
+```
+
+In strict mode:
+* All relevant elements are checked, so mixed-content containers match no candidate rather than whichever type the sample happened to hit.
+* Empty containers provide no element evidence and match vacuously; if multiple generic candidates still can't be ordered, an explicit `DispatchError` is raised - registration order is never used as a tiebreaker.
+* Recursive containers terminate (a revisited object is assumed to match).
+* Iterators and generators are never consumed; they fall back to their plain runtime type.
+* Results are not cached by outer type, so mutating and reusing an object re-evaluates dispatch on the next call.
+
 ### classes
 `classmethod` and `staticmethod` may be used with a multimethod, but must be applied _last_, i.e., wrapping the final multimethod definition after all functions are registered. For class and instance methods, `cls` and `self` participate in the dispatch as usual. They may be left blank when using annotations, otherwise use `object` as a placeholder.
 
