@@ -1,0 +1,75 @@
+---
+title: "Combined"
+---
+
+## combined
+`combined` is an opt-in multimethod supporting explicit method combination alongside ordinary dispatch. Four kinds of methods are registered separately and ordered by specificity into chains:
+
+* `primary` methods provide the main behavior; `register` is an alias.
+* `before` methods run first, from specific to general.
+* `after` methods run after a normal primary return, from general to specific.
+* `around` methods wrap the rest, specific outermost, and may short-circuit.
+
+```{python}
+from multimethod import combined
+
+events = []
+
+
+@combined
+def process(x):
+    events.append("primary-object")
+    return "object"
+
+
+@process.primary
+def _(x: int, *, next_method):
+    events.append("primary-int")
+    return "int:" + next_method()
+
+
+@process.before
+def _(x: int):
+    events.append("before-int")
+
+
+@process.after
+def _(x: int):
+    events.append("after-int")
+
+
+@process.around
+def _(x: int, *, next_method):
+    events.append("around-int-enter")
+    result = next_method()
+    events.append("around-int-exit")
+    return result.upper()
+
+
+process(1)
+```
+
+```{python}
+events
+```
+
+`before` and `after` methods are side effects only. `after` methods are skipped if the primary chain or an `around` method raises, and exceptions unwind through the `around` chain naturally. An `around` method which never calls `next_method` short-circuits validation, audit, and primary behavior.
+
+## next-method
+A `primary` or `around` method opts into chaining by declaring a keyword-only `next_method` parameter. It is bound to the candidate snapshot resolved for the current call, so invoking it never re-enters the dispatcher. It takes no arguments, may be called repeatedly, and raises `NoNextMethod` at the broadest implementation.
+
+```{python}
+@combined
+def chain(x):
+    return "object"
+
+
+@chain.primary
+def _(x: int, *, next_method):
+    return "int:" + next_method()
+
+
+chain(True)
+```
+
+Incomparable applicable methods - for example siblings reached through multiple inheritance - raise `DispatchError` in every chain, independent of registration or dictionary order. The feature is opt-in: plain `multimethod` objects retain single-function dispatch.

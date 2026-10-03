@@ -10,6 +10,8 @@ reference:
   contents:
   - multimethod
   - multidispatch
+  - combined
   - subtype
   - parametric
   - DispatchError
+  - NoNextMethod

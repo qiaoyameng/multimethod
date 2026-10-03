@@ -450,3 +450,280 @@ class multimeta(type):
             if callable(value):
                 value = getattr(self.get(key), "register", multimethod)(value)
             super().__setitem__(key, value)
+
+
+class NoNextMethod(DispatchError):
+    """Raised when a `next_method` has no broader implementation to call."""
+
+
+KINDS = ("primary", "before", "after", "around")
+
+
+def _wants_next_method(func: Callable) -> bool:
+    """Whether `func` declares a keyword-only `next_method` parameter."""
+    with contextlib.suppress((TypeError, ValueError)):
+        params = inspect.signature(func).parameters.values()
+        return any(
+            param.name == "next_method" and param.kind is param.KEYWORD_ONLY for param in params
+        )
+    return False
+
+
+class combined(multimethod):
+    """An opt-in multimethod supporting explicit method combination.
+
+    Four kinds of methods may be registered:
+
+    * ``primary`` methods provide the main behavior (the default for ``register``).
+      A primary method may declare a keyword-only ``next_method`` parameter, which calls
+      the next broader primary method.
+    * ``before`` methods run first, ordered from specific to general.
+    * ``after`` methods run after the primary chain returns normally, ordered from general
+      to specific. They are skipped if any primary or around method raises.
+    * ``around`` methods wrap everything except ``before`` methods, ordered from specific
+      to general. An around method may declare ``next_method`` to proceed to the next
+      around method, or to the primary chain; omitting the call short-circuits.
+
+    ``next_method`` takes no arguments: it is bound to a snapshot of the applicable
+    methods for the current call and may be invoked multiple times.
+    """
+
+    registries: tuple[multimethod, multimethod, multimethod, multimethod]
+
+    def __new__(cls, func):
+        homonym = inspect.currentframe().f_back.f_locals.get(func.__name__)
+        if isinstance(homonym, combined):
+            return homonym
+        self = functools.update_wrapper(dict.__new__(cls), func)
+        self.pending = set()
+        self.generics = []
+        self.registries = tuple(cls._make_registry(func.__name__) for _ in KINDS)
+        self._chains = {}
+        return self
+
+    @staticmethod
+    def _make_registry(name: str) -> multimethod:
+        registry = dict.__new__(multimethod)
+        functools.update_wrapper(registry, lambda: None)
+        registry.__name__ = name
+        registry.__doc__ = None
+        registry.pending = set()
+        registry.generics = []
+        return registry
+
+    @staticmethod
+    def _copy_registry(registry: multimethod) -> multimethod:
+        clone = dict.__new__(multimethod)
+        dict.__ior__(clone, registry)
+        clone.pending = set(registry.pending)
+        clone.generics = list(registry.generics)
+        return clone
+
+    def copy(self):
+        """Return a new combined multimethod with the same methods."""
+        clone = dict.__new__(type(self))
+        dict.__init__(clone)
+        functools.update_wrapper(clone, self.__wrapped__)
+        clone.pending = set()
+        clone.generics = []
+        clone.registries = tuple(map(self._copy_registry, self.registries))
+        clone._chains = {}
+        return clone
+
+    def __init__(self, func: Callable):
+        self._store("primary", None, func)
+
+    def _store(self, kind: str, types, func: Callable):
+        registry = self.registries[KINDS.index(kind)]
+        try:
+            if types is None:
+                types = signature.from_hints(func)
+            registry[types] = func
+        except (NameError, AttributeError):
+            registry.pending.add(func)
+        self._chains.clear()
+        self.__doc__ = self.docstring
+
+    def __setitem__(self, types: tuple, func: Callable):
+        if not isinstance(types, signature) and not isinstance(types, tuple):
+            types = (types,)
+        self._store("primary", types, func)
+
+    def _register(self, kind: str, *args) -> Callable:
+        """Decorator for registering a function of the given kind."""
+        if len(args) == 1 and callable(args[0]) and not isinstance(args[0], type):
+            self._store(kind, None, args[0])
+            return self if self.__name__ == args[0].__name__ else args[0]
+
+        def decorator(func: REGISTERED) -> REGISTERED:
+            self._store(kind, args, func)
+            return func
+
+        return decorator
+
+    def register(self, *args) -> Callable:
+        """Decorator registering a primary function."""
+        return self._register("primary", *args)
+
+    def primary(self, *args) -> Callable:
+        """Decorator registering a primary function."""
+        return self._register("primary", *args)
+
+    def before(self, *args) -> Callable:
+        """Decorator registering a before function."""
+        return self._register("before", *args)
+
+    def after(self, *args) -> Callable:
+        """Decorator registering an after function."""
+        return self._register("after", *args)
+
+    def around(self, *args) -> Callable:
+        """Decorator registering an around function."""
+        return self._register("around", *args)
+
+    def evaluate(self):
+        """Evaluate any pending forward references in every registry."""
+        for registry in self.registries:
+            while registry.pending:
+                func = registry.pending.pop()
+                registry[signature.from_hints(func)] = func
+                self._chains.clear()
+
+    def resolve(self, args: tuple) -> tuple:
+        """Return the four specificity-ordered method chains for `args`."""
+        self.evaluate()
+        types = tuple(map(type, args))
+        try:
+            return self._chains[types]
+        except KeyError:
+            pass
+        generic = any(any(map(issubclass, types, registry.generics)) for registry in self.registries)
+        chains = tuple(self._chain(registry, args, types, generic) for registry in self.registries)
+        self._chains[types] = chains
+        return chains
+
+    def _chain(self, registry: multimethod, args: tuple, types: tuple, generic: bool) -> tuple:
+        if generic:
+            candidates = {
+                (key, registry[key])
+                for key in registry
+                if isinstance(key, signature) and key.instances(*args)
+            }
+        else:
+            candidates = {
+                (key, registry[key])
+                for key in registry
+                if isinstance(key, signature)
+                and key.required <= len(args)
+                and key.callable(*types)
+                and all(map(issubclass, types, key))
+            }
+        return self._order(candidates, types)
+
+    def _order(self, candidates: set, types: tuple) -> tuple:
+        """Total-order candidates by specificity, never relying on dict order."""
+
+        def precedes(left, right) -> int:
+            left_key, _ = left
+            right_key, _ = right
+            if left_key == right_key:
+                return 0
+            left_below = right_key.subtypes(*left_key)
+            right_below = left_key.subtypes(*right_key)
+            if left_below and not right_below:
+                return -1
+            if right_below and not left_below:
+                return 1
+            return 0  # equal specificity (either direction) or incomparable
+
+        ordered = sorted(candidates, key=functools.cmp_to_key(precedes))
+        result = []
+        for index, (key, func) in enumerate(ordered):
+            for other_key, other_func in ordered[index + 1 :]:
+                key_below = other_key.subtypes(*key)
+                other_below = key.subtypes(*other_key)
+                if not key_below and not other_below:
+                    funcs = {item[1] for item in candidates}
+                    raise DispatchError(
+                        f"{self.__name__}: {len(funcs)} methods found", types, funcs
+                    )
+            if result:
+                previous_key, previous_func, _ = result[-1]
+                equivalent = previous_key.subtypes(*key) and key.subtypes(*previous_key)
+                if equivalent and func is not previous_func:
+                    funcs = {item[1] for item in candidates}
+                    raise DispatchError(
+                        f"{self.__name__}: {len(funcs)} methods found", types, funcs
+                    )
+                if equivalent:
+                    continue
+            result.append((key, func, _wants_next_method(func)))
+        return tuple(result)
+
+    def dispatch(self, *args) -> Callable:
+        chains = self.resolve(args)
+        return functools.partial(self.execute, args, {}, chains)
+
+    def execute(self, args: tuple, kwargs: dict, chains: tuple):
+        """Run the combined protocol for `args` against snapshot `chains`."""
+        primary, before, after, around = chains
+
+        def call_primary(index: int):
+            _, func, wants_next = primary[index]
+            if not wants_next:
+                return func(*args, **kwargs)
+
+            def next_method(*next_args, **next_kwargs):
+                if next_args or next_kwargs:
+                    raise TypeError("next_method() takes no arguments")
+                next_index = index + 1
+                if next_index == len(primary):
+                    raise NoNextMethod(f"{self.__name__}: no broader primary method", args)
+                return call_primary(next_index)
+
+            return func(*args, next_method=next_method, **kwargs)
+
+        def run_core():
+            if not primary:
+                raise DispatchError(f"{self.__name__}: no methods found", args)
+            for _, func, _ in before:
+                func(*args, **kwargs)
+            result = call_primary(0)
+            for _, func, _ in reversed(after):  # audit only; return values discarded
+                func(*args, **kwargs)
+            return result
+
+        def call_around(index: int):
+            _, func, wants_next = around[index]
+            if not wants_next:
+                return func(*args, **kwargs)
+
+            def next_method(*next_args, **next_kwargs):
+                if next_args or next_kwargs:
+                    raise TypeError("next_method() takes no arguments")
+                next_index = index + 1
+                if next_index == len(around):
+                    return run_core()
+                return call_around(next_index)
+
+            return func(*args, next_method=next_method, **kwargs)
+
+        if around:
+            return call_around(0)
+        return run_core()
+
+    def __call__(self, *args, **kwargs):
+        """Resolve and run the combined method chain."""
+        chains = self.resolve(args)
+        return self.execute(args, kwargs, chains)
+
+    @property
+    def docstring(self):
+        """a descriptive docstring of all registered functions"""
+        docs = []
+        for kind, registry in zip(KINDS, self.registries):
+            for key, func in registry.items():
+                sig = getattr(key, "sig", "")
+                if func.__doc__:
+                    docs.append(f"#{kind} {func.__name__}{sig}\n    {func.__doc__}")
+        return "\n\n".join(docs)

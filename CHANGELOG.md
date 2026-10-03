@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
+### Added
+* `combined` multimethod with `primary`, `before`, `after`, and `around` registration
+* `next_method` chaining bound to the per-call candidate snapshot
+* `NoNextMethod` for calling past the broadest method
 
 ## [2.1](https://pypi.org/project/multimethod/2.1/) - 2026-07-28
 ### Changed

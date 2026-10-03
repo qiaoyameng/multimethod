@@ -79,6 +79,44 @@ Dispatch resolution details:
 ### multidispatch
 `multidispatch` is a wrapper to provide compatibility with `functools.singledispatch`. It requires a base implementation and use of the `register` method instead of namespace lookup. It also supports dispatching on keyword arguments.
 
+### combined
+`combined` is an opt-in multimethod which adds explicit method combination. Four kinds of methods can be registered: `primary` (also the default for `register`), `before`, `after`, and `around`. Applicable methods of each kind are ordered by specificity into a single chain; incomparable candidates raise `DispatchError`, regardless of registration order.
+
+* `before` methods run from specific to general, before the primary chain.
+* `after` methods run from general to specific, only when the primary chain returns normally; their return values are discarded.
+* `around` methods wrap the others, specific outermost. Declaring a keyword-only `next_method` parameter proceeds to the next `around` method or the primary chain. Not calling it short-circuits the call.
+* A `primary` or `around` method declares a keyword-only `next_method` to call the next broader implementation. It is bound to the candidate snapshot of the current call (no re-dispatch), takes no arguments, and may be called multiple times. Calling it with arguments raises `TypeError`; calling the last method raises `NoNextMethod`.
+
+```python
+from multimethod import combined
+
+
+@combined
+def process(x):
+    return "object"
+
+
+@process.before
+def _(x: int):  # validation, specific to general
+    ...
+
+
+@process.after
+def _(x: int):  # audit, general to specific
+    ...
+
+
+@process.primary
+def _(x: int, *, next_method):
+    return "int:" + next_method()  # call the broader `object` implementation
+
+
+@process.around
+def _(x: int, *, next_method):
+    result = next_method()  # proceed; omit this call to short-circuit
+    return result.upper()
+```
+
 ### instance checks
 `subtype` provisionally provides `isinstance` and `issubclass` checks for generic types. When called on a non-generic, it will return the origin type.
 
