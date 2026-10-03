@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
+### Added
+* `multimethod.check()` registry-only ambiguity analysis with type/value witnesses;
+  undecidable overlaps (complex ABCs, `parametric` predicates, future subclasses)
+  are reported as unknown with a reason, without invoking user code
 
 ## [2.1](https://pypi.org/project/multimethod/2.1/) - 2026-07-28
 ### Changed

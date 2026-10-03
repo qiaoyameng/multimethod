@@ -2,9 +2,11 @@ import abc
 import builtins
 import collections
 import contextlib
+import dataclasses
 import functools
 import inspect
 import itertools
+import operator
 import types
 import typing
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -257,6 +259,401 @@ class signature(tuple):
 REGISTERED = TypeVar("REGISTERED", bound=Callable[..., Any])
 
 
+@dataclasses.dataclass(frozen=True)
+class Conflict:
+    """A pair of signatures which may dispatch ambiguously.
+
+    Attributes:
+        signatures: the two overlapping registered signatures
+        witness: a type tuple applicable to both signatures, or ``None``
+        reason: why the analysis could or could not produce a definitive witness
+        covered: a signature proved more specific than both over the witness, if any
+    """
+
+    signatures: tuple[signature, signature]
+    witness: tuple | None
+    reason: str
+    covered: signature | None = None
+
+    def __str__(self) -> str:
+        first, second = self.signatures
+        witness = tuple(str(item) for item in self.witness) if self.witness is not None else None
+        text = f"{first} vs {second}: {self.reason}"
+        if witness is not None:
+            text += f"; witness {witness}"
+        if self.covered is not None:
+            text += f"; covered by {self.covered}"
+        return text
+
+
+@dataclasses.dataclass
+class Report:
+    """Result of a registry-only ambiguity analysis.
+
+    ``conflicts`` holds provable ambiguities with a witness; ``unknown`` holds pairs
+    whose applicability overlap could not be proven empty or covered.
+    Runtime dispatch remains the final authority.
+    """
+
+    name: str
+    conflicts: list[Conflict] = dataclasses.field(default_factory=list)
+    unknown: list[Conflict] = dataclasses.field(default_factory=list)
+
+    def __str__(self) -> str:
+        lines = [f"{self.name}: {len(self.conflicts)} ambiguous, {len(self.unknown)} unknown"]
+        lines += [f"  ambiguous: {conflict}" for conflict in self.conflicts]
+        lines += [f"  unknown: {conflict}" for conflict in self.unknown]
+        return "\n".join(lines)
+
+
+@dataclasses.dataclass(frozen=True)
+class ValueWitness:
+    """A safe, constructor-free value description (e.g. an empty container)."""
+
+    origin: type
+
+    def __str__(self) -> str:
+        literals = {
+            builtins.list: "[]",
+            builtins.dict: "{}",
+            builtins.set: "set()",
+            builtins.frozenset: "frozenset()",
+            builtins.tuple: "()",
+        }
+        return literals.get(self.origin, f"{self.origin.__name__}()")
+
+    @property
+    def value(self):
+        return self.origin()
+
+
+@dataclasses.dataclass(frozen=True)
+class LiteralValue:
+    """A safe literal value shared by two intersecting literal signatures."""
+
+    value: object
+
+    def __str__(self) -> str:
+        return repr(self.value)
+
+
+_EMPTY = "empty"
+_NONEMPTY = "nonempty"
+_UNKNOWN = "unknown"
+
+_CONTAINER_ORIGINS = {
+    builtins.list,
+    builtins.dict,
+    builtins.set,
+    builtins.frozenset,
+    builtins.tuple,
+    collections.deque,
+    collections.defaultdict,
+    collections.OrderedDict,
+}
+
+_LEAF_TYPES = frozenset(
+    {
+        builtins.bool,
+        builtins.int,
+        builtins.float,
+        builtins.complex,
+        builtins.str,
+        builtins.bytes,
+        builtins.bytearray,
+        builtins.range,
+        builtins.frozenset,
+        builtins.tuple,
+    }
+)
+
+
+def _is_parametric(tp) -> bool:
+    return isinstance(tp, type) and type(tp) is parametric
+
+
+def _is_plain(tp) -> bool:
+    """Whether ``isinstance``/``issubclass`` of ``tp`` runs no user predicates."""
+    metacls = type(tp)
+    if _is_parametric(tp) or not isinstance(metacls, type):
+        return False
+    return metacls in (type, abc.ABCMeta, subtype)
+
+
+def _container_witness(origin, args) -> type:
+    """Construct a concrete parameterized subtype, or ``None`` if impossible."""
+    if not args:
+        return None
+    params = [arg for arg in args if arg is not Ellipsis]
+    try:
+        subscript = tuple(params) if Ellipsis not in args else (params[0], Ellipsis)
+        return subtype(origin[subscript])
+    except (TypeError, ValueError):
+        return None
+
+
+def _literal(values) -> type:
+    return subtype(typing.Literal[tuple(values)] if len(values) > 1 else values[0])
+
+
+def _sealed(value_type: type) -> bool:
+    """Whether a literal value's type cannot acquire virtual subtypes."""
+    return value_type.__module__ == "builtins" and not isinstance(value_type, abc.ABCMeta)
+
+
+def _meet_literal_value(value, other) -> tuple[str, type | None, str]:
+    if isinstance(value, other):
+        return _NONEMPTY, LiteralValue(value), "literal"
+    value_type = type(value)
+    other_origin = get_origin(other)
+    if other_origin in _CONTAINER_ORIGINS:
+        return _EMPTY, None, "literal value is not a container"
+    if (
+        other_origin is not None
+        and isinstance(other_origin, type)
+        and issubclass(value_type, other_origin)
+    ):
+        args = get_args(other)
+        if not args:
+            reason = f"literal is an instance of {other_origin.__name__}"
+            return _NONEMPTY, _literal([value]), reason
+        reason = f"literal {value_type.__name__} cannot match generic {other_origin.__name__}"
+        return _EMPTY, None, reason
+    if _sealed(value_type) and (
+        other_origin is None
+        and not issubclass(value_type, other)
+    ):
+        return _EMPTY, None, f"sealed {value_type.__name__} cannot be a {other.__name__}"
+    return _UNKNOWN, None, "literal type may satisfy a virtual or future subclass"
+
+
+def _union(members) -> type:
+    members = tuple(dict.fromkeys(members))
+    return members[0] if len(members) == 1 else subtype(functools.reduce(operator.or_, members))
+
+
+def _meet(left, right) -> tuple[str, type | None, str]:
+    """Intersection of two normalized types.
+
+    Returns a triple of status, a witness type and a reason.
+    Status is one of ``'nonempty'`` (a common subtype is proven),
+    ``'empty'`` (the intersection is proven empty) or ``'unknown'``.
+    Only ordinary inheritance, unions, literals and concrete containers are decided;
+    complex ABCs, parametric predicates and possible future multiple inheritance
+    return ``'unknown'``.
+    """
+    left_literal = get_origin(left) is typing.Literal
+    right_literal = get_origin(right) is typing.Literal
+    if left_literal or right_literal:
+        literal_tp, other = (left, right) if left_literal else (right, left)
+        if _is_parametric(other):
+            return _UNKNOWN, None, "parametric predicates cannot be evaluated statically"
+        if get_origin(other) is types.UnionType:
+            results = [_meet(literal_tp, arg) for arg in get_args(other)]
+        elif get_origin(other) is typing.Literal:
+            values = [
+                value
+                for value in get_args(literal_tp)
+                if any(
+                    type(value) is type(other_value) and value == other_value
+                    for other_value in get_args(other)
+                )
+            ]
+            results = (
+                [(_NONEMPTY, LiteralValue(values[0]), "literal")]
+                if values
+                else [(_EMPTY, None, "literals share no values")]
+            )
+        else:
+            values = get_args(literal_tp)
+            if not _is_plain(other):
+                return _UNKNOWN, None, "literal checked against a non-plain type"
+            results = [_meet_literal_value(value, other) for value in values]
+        return _fold(results, "literal")
+    if get_origin(left) is types.UnionType or get_origin(right) is types.UnionType:
+        left_args = get_args(left) if get_origin(left) is types.UnionType else (left,)
+        right_args = get_args(right) if get_origin(right) is types.UnionType else (right,)
+        results = [_meet(a, b) for a in left_args for b in right_args]
+        return _fold(results, "union")
+    if _is_parametric(left) or _is_parametric(right):
+        return _UNKNOWN, None, "parametric predicates cannot be evaluated statically"
+    try:
+        if issubclass(left, right):
+            return _NONEMPTY, left, "inheritance"
+        if issubclass(right, left):
+            return _NONEMPTY, right, "inheritance"
+    except TypeError as error:
+        return _UNKNOWN, None, f"uncomparable types: {error}"
+    left_origin = get_origin(left)
+    right_origin = get_origin(right)
+    if left_origin is None or right_origin is None:
+        if (
+            left_origin is None
+            and right_origin is None
+            and left in _LEAF_TYPES
+            and right in _LEAF_TYPES
+            and not issubclass(left, right)
+            and not issubclass(right, left)
+        ):
+            reason = f"sealed builtins {left.__name__} and {right.__name__} cannot share a subclass"
+            return _EMPTY, None, reason
+        names = f"{left.__name__}, {right.__name__}"
+        return _UNKNOWN, None, f"unrelated classes {names}; a future common subclass is possible"
+    if left_origin not in _CONTAINER_ORIGINS or right_origin not in _CONTAINER_ORIGINS:
+        return _UNKNOWN, None, f"{left_origin.__name__} has structural or virtual subtypes"
+    if left_origin is not right_origin:
+        reason = "different concrete containers; a multiple-inheritance subclass is possible"
+        return _UNKNOWN, None, reason
+    left_args = get_args(left)
+    right_args = get_args(right)
+    if not left_args or not right_args:
+        if left_origin is builtins.tuple:
+            return _NONEMPTY, left if not left_args else right, "unparameterized tuple"
+        reason = "empty instance matches any parameterization"
+        return _NONEMPTY, ValueWitness(left_origin), reason
+    if left_origin is builtins.tuple:
+        if Ellipsis not in left_args and Ellipsis not in right_args:
+            if len(left_args) != len(right_args):
+                return _EMPTY, None, "fixed-length tuples have different lengths"
+            meets = [_meet(a, b) for a, b in zip(left_args, right_args)]
+        elif Ellipsis in left_args and Ellipsis in right_args:
+            meets = [_meet(left_args[0], right_args[0])]
+        else:
+            fixed = left_args if Ellipsis not in left_args else right_args
+            variadic = left_args[0] if Ellipsis in left_args else right_args[0]
+            meets = [_meet(arg, variadic) for arg in fixed]
+        if any(status == _EMPTY for status, _, _ in meets):
+            return _EMPTY, None, "tuple element types are disjoint"
+        if all(status == _NONEMPTY for status, _, _ in meets):
+            args = tuple(witness for _, witness, _ in meets)
+            variadic_tuple = Ellipsis in left_args or Ellipsis in right_args
+            subscript = (args[0], Ellipsis) if variadic_tuple else args
+            return _NONEMPTY, left_origin[subscript], "tuple elements intersect"
+        return _UNKNOWN, None, "tuple element overlap not provable"
+    meets = [_meet(a, b) for a, b in zip(left_args, right_args)]
+    if all(status == _NONEMPTY for status, _, _ in meets):
+        args = tuple(witness for _, witness, _ in meets)
+        if all(isinstance(arg, type) for arg in args) and (
+            witness := _container_witness(left_origin, args)
+        ) is not None:
+            return _NONEMPTY, witness, "container parameters intersect"
+        return _UNKNOWN, ValueWitness(left_origin), "empty instance matches both parameterizations"
+    if not any(status == _EMPTY for status, _, _ in meets) and any(
+        status == _UNKNOWN for status, _, _ in meets
+    ):
+        return _UNKNOWN, ValueWitness(left_origin), "empty instance matches both parameterizations"
+    return _NONEMPTY, ValueWitness(left_origin), "empty instance matches both parameterizations"
+
+
+def _fold(results, kind) -> tuple[str, type | None, str]:
+    """Combine branch intersections of a literal or union type."""
+    statuses = {status for status, _, _ in results}
+    witnesses = [witness for status, witness, _ in results if status == _NONEMPTY]
+    if _UNKNOWN in statuses:
+        reasons = "; ".join(
+            dict.fromkeys(reason for status, _, reason in results if status == _UNKNOWN)
+        )
+        detail = f"{kind} overlap not provable ({reasons})"
+        if witnesses:
+            return _UNKNOWN, _combine_witnesses(witnesses), f"proven {kind} overlap, but {reasons}"
+        return _UNKNOWN, None, detail
+    if witnesses:
+        return _NONEMPTY, _combine_witnesses(witnesses), f"{kind} branches intersect"
+    return _EMPTY, None, f"all {kind} branches are disjoint"
+
+
+def _combine_witnesses(witnesses):
+    if len(witnesses) == 1:
+        return witnesses[0]
+    if all(isinstance(item, type) for item in witnesses):
+        return _union(witnesses)
+    return tuple(witnesses)
+
+
+def _more_specific(sig: signature, other: signature) -> bool:
+    """Whether ``sig`` is strictly more specific than ``other`` at every position."""
+    return bool(sig) and other.subtypes(*sig) and not sig.subtypes(*other)
+
+
+def _witness_applies(item, tp) -> bool:
+    if isinstance(item, ValueWitness):
+        return isinstance(item.value, tp)
+    if isinstance(item, LiteralValue):
+        return isinstance(item.value, tp)
+    return issubclass(item, tp)
+
+
+def _covered(first: signature, second: signature, witness: tuple, signatures) -> signature | None:
+    """Find a unique registered signature dominating the ambiguity over a witness."""
+    winners = []
+    for candidate in signatures:
+        if candidate is first or candidate is second or candidate.required > len(witness):
+            continue
+        checked = witness[: len(candidate)]
+        if len(checked) != len(candidate) or not all(
+            _witness_applies(item, tp) for item, tp in zip(checked, candidate)
+        ):
+            continue
+        if not _more_specific(candidate, first) or not _more_specific(candidate, second):
+            continue
+        checked_types = tuple(
+            type(item.value)
+            if isinstance(item, (ValueWitness, LiteralValue))
+            else item
+            for item in checked
+        )
+        if not candidate.callable(*checked_types):
+            continue
+        winners.append(candidate)
+    if len({tuple(winner) for winner in winners}) != 1:
+        return None
+    return winners[0]
+
+
+def _analyze(multimethod) -> Report:
+    signatures = [key for key in list(multimethod) if isinstance(key, signature)]
+    report = Report(multimethod.__name__)
+    for index, first in enumerate(signatures):
+        for second in signatures[index + 1 :]:
+            if first.subtypes(*second) or second.subtypes(*first):
+                continue
+            arity = max(first.required, second.required)
+            if arity > len(first) or arity > len(second):
+                continue
+            meets = [
+                _meet(first[position], second[position]) for position in range(arity)
+            ]
+            pair = (first, second)
+            if any(status == _EMPTY for status, _, _ in meets):
+                continue
+            if multimethod[first] is multimethod[second]:
+                continue  # duplicate registrations of one function resolve to it
+            witness = tuple(tp for _, tp, _ in meets)
+            proven = all(status == _NONEMPTY for status, _, _ in meets)
+            if None not in witness:
+                winner = _covered(first, second, witness, signatures)
+                if winner is not None:
+                    continue
+                reason = "overlapping signatures with no unique more specific overload"
+                if not proven:
+                    unknown = "; ".join(
+                        dict.fromkeys(
+                            reason
+                            for status, _, reason in meets
+                            if status == _UNKNOWN
+                        )
+                    )
+                    reason += f"; partial witness, {unknown}"
+                report.conflicts.append(Conflict(pair, witness, reason, winner))
+            else:
+                reasons = "; ".join(
+                    dict.fromkeys(reason for status, _, reason in meets if status == _UNKNOWN)
+                )
+                reason = f"applicability overlap undecidable ({reasons})"
+                report.unknown.append(Conflict(pair, None, reason))
+    return report
+
+
 class multimethod(dict):
     """A callable directed acyclic graph of methods."""
 
@@ -386,6 +783,18 @@ class multimethod(dict):
         while self.pending:
             func = self.pending.pop()
             self[signature.from_hints(func)] = func
+
+    def check(self) -> Report:
+        """Analyze the registry only, without dispatching or constructing values.
+
+        Return a `Report` of signature pairs whose applicability overlap cannot be
+        resolved by a unique more specific overload. Provable ambiguities include a
+        type or safe-value witness; undecidable pairs (complex ABCs, parametric
+        predicates, possible future subclasses) are reported as unknown with a reason.
+        No user constructors or predicates are invoked.
+        """
+        self.evaluate()
+        return _analyze(self)
 
     @property
     def docstring(self):
