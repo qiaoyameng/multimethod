@@ -1,6 +1,7 @@
 import abc
 import builtins
 import collections
+import contextvars
 import contextlib
 import functools
 import inspect
@@ -11,6 +12,104 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any, Self, TypeVar, Union, get_type_hints
 
 TypeAliasType = getattr(typing, "TypeAliasType", types.new_class(""))  # python <3.12
+
+_missing_func = object()
+_subclass_checks = contextvars.ContextVar("_subclass_checks", default=())
+_instance_checks = contextvars.ContextVar("_instance_checks", default=())
+_alias_context = contextvars.ContextVar("_alias_context", default=None)
+
+
+def _alias_contains(alias, tp=None, seen=None) -> bool:
+    tp = alias.__value__ if tp is None else tp
+    seen = set() if seen is None else seen
+    if id(tp) in seen:
+        return False
+    seen.add(id(tp))
+    if tp is alias:
+        return True
+    if isinstance(tp, TypeAliasType):
+        if _alias_contains(alias, tp.__value__, seen):
+            return True
+    return any(_alias_contains(alias, arg, seen) for arg in get_args(tp))
+
+
+def _strict_isinstance(instance, cls) -> bool:
+    """Check every element of a materialized container without consuming iterators."""
+    recursive: set[tuple[int, object]] = set()
+    return _strict_isinstance_check(instance, cls, recursive)
+
+
+def _strict_isinstance_value(instance, cls, recursive: set[tuple[int, object]]):
+    return _strict_isinstance_check(instance, cls, recursive)
+
+
+def _strict_isinstance_check(instance, cls, recursive: set[tuple[int, object]]):
+    if not issubclass(type(cls), subtype):
+        return builtins.isinstance(instance, cls)
+    origin = get_origin(cls)
+    args = get_args(cls)
+    recursive_alias = getattr(cls, "__recursive_alias__", None)
+    if not args:
+        return builtins.isinstance(instance, cls)
+    if origin in (typing.Literal, builtins.type, typing.NewType):
+        return builtins.isinstance(instance, cls)
+
+    pair = id(instance), recursive_alias
+    repeated = recursive_alias is not None and pair in recursive
+    if repeated and origin in (typing.Union, types.UnionType):
+        return True
+    if origin in (typing.Union, types.UnionType):
+        tracked = recursive_alias is not None and not repeated
+        if tracked:
+            recursive.add(pair)
+        result = any(_strict_isinstance_value(instance, arg, recursive) for arg in args)
+        if tracked and not result:
+            recursive.discard(pair)
+        return result
+
+    if isinstance(instance, typing.Generic):
+        return builtins.isinstance(instance, cls)
+    if not builtins.isinstance(instance, origin) or isinstance(instance, Iterator):
+        return False
+    if origin is Callable:
+        return builtins.isinstance(instance, cls)
+    if repeated:
+        return True
+    tracked = recursive_alias is not None
+    if tracked:
+        recursive.add(pair)
+    try:
+        if isinstance(instance, tuple):
+            if origin is builtins.tuple:
+                if ... not in args and len(instance) != len(args):
+                    return False
+                item_args = (args[0],) * len(instance) if ... in args else args
+            else:
+                item_args = (args[0],) * len(instance)
+            return all([
+                _strict_isinstance_value(value, item_args[index], recursive)
+                for index, value in enumerate(instance)
+            ])
+        if isinstance(instance, dict):
+            if issubclass(origin, Mapping):
+                return all([
+                    _strict_isinstance_check(key, args[0], set()) for key in instance
+                ]) and all([
+                    _strict_isinstance_value(value, args[1], recursive)
+                    for value in instance.values()
+                ])
+            return all([
+                _strict_isinstance_check(key, args[0], set()) for key in instance
+            ])
+        if isinstance(instance, (list, set, frozenset)):
+            return all([
+                _strict_isinstance_value(value, args[0], recursive)
+                for value in instance
+            ])
+        return True
+    finally:
+        if tracked:
+            recursive.discard(pair)
 
 
 class DispatchError(TypeError):
@@ -53,7 +152,36 @@ class subtype(abc.ABCMeta):
             case typing._AnnotatedAlias():
                 return cls(tp.__origin__)
             case TypeAliasType():
-                return cls(tp.__value__)
+                aliases = _alias_context.get()
+                if aliases is not None and tp in aliases:
+                    return aliases[tp]
+                if not _alias_contains(tp):
+                    return cls(tp.__value__)
+                origin = get_origin(tp.__value__)
+                if origin is typing.Literal:
+                    origin = typing.Literal
+                elif origin in (typing.Union, types.UnionType):
+                    origin = types.UnionType
+                else:
+                    origin = origin or tp.__value__
+                namespace = {
+                    "__origin__": origin,
+                    "__args__": (),
+                    "__recursive_alias__": tp,
+                }
+                converted = type.__new__(cls, str(tp), (object,), namespace)
+                if aliases is None:
+                    aliases = {}
+                    token = _alias_context.set(aliases)
+                else:
+                    token = None
+                aliases[tp] = converted
+                try:
+                    converted.__args__ = tuple(map(cls, get_args(tp.__value__)))
+                    return converted
+                finally:
+                    if token is not None:
+                        _alias_context.reset(token)
             case type():
                 return tp
         origin = get_origin(tp) or tp
@@ -81,12 +209,32 @@ class subtype(abc.ABCMeta):
         return self.__origin__, *self.__args__
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, subtype) and self.key() == other.key()
+        if isinstance(other, subtype):
+            recursive = getattr(self, "__recursive_alias__", None)
+            other_recursive = getattr(other, "__recursive_alias__", None)
+            if recursive is not None or other_recursive is not None:
+                return recursive is other_recursive
+            return self.key() == other.key()
+        return False
 
     def __hash__(self):
+        recursive = getattr(self, "__recursive_alias__", None)
+        if recursive is not None:
+            return hash(recursive)
         return hash(self.key())
 
     def __subclasscheck__(self, subclass):
+        check = id(subclass), id(self)
+        active = set(_subclass_checks.get())
+        if check in active:
+            return True
+        token = _subclass_checks.set(tuple(active | {check}))
+        try:
+            return self.__subclasscheck_impl__(subclass)
+        finally:
+            _subclass_checks.reset(token)
+
+    def __subclasscheck_impl__(self, subclass):
         args = get_args(subclass)
         match origin := get_origin(subclass):
             case None:
@@ -95,6 +243,8 @@ class subtype(abc.ABCMeta):
                 return all(isinstance(arg, self) for arg in args)
             case typing.Union | types.UnionType:
                 return all(issubclass(cls, self) for cls in args)
+        if origin is builtins.tuple and ... in args and ... not in self.__args__:
+            return False
         match self.__origin__:
             case typing.Literal:
                 return False
@@ -121,6 +271,17 @@ class subtype(abc.ABCMeta):
         )
 
     def __instancecheck__(self, instance):
+        check = id(instance), id(self)
+        active = set(_instance_checks.get())
+        if check in active:
+            return True
+        token = _instance_checks.set(tuple(active | {check}))
+        try:
+            return self.__instancecheck_impl__(instance)
+        finally:
+            _instance_checks.reset(token)
+
+    def __instancecheck_impl__(self, instance):
         match self.__origin__:
             case typing.Literal:
                 return any(type(arg) is type(instance) and arg == instance for arg in self.__args__)
@@ -253,6 +414,10 @@ class signature(tuple):
         """Return whether all arguments are instances."""
         return self.required <= len(args) and all(map(isinstance, args, self))
 
+    def strict_instances(self, *args) -> bool:
+        """Return whether all arguments are instances, checking materialized containers fully."""
+        return self.required <= len(args) and all(map(_strict_isinstance, args, self))
+
 
 REGISTERED = TypeVar("REGISTERED", bound=Callable[..., Any])
 
@@ -263,8 +428,15 @@ class multimethod(dict):
     __name__: str
     pending: set
     generics: list[tuple]  # positional bases which require instance checks
+    strict_containers: bool
 
-    def __new__(cls, func):
+    def __new__(
+        cls,
+        func: Callable = _missing_func,
+        strict_containers: bool | None = None,
+    ):
+        if func is _missing_func:
+            return lambda wrapped: cls(wrapped, strict_containers=strict_containers)
         homonym = inspect.currentframe().f_back.f_locals.get(func.__name__)
         if isinstance(homonym, multimethod):
             return homonym
@@ -272,9 +444,19 @@ class multimethod(dict):
         self = functools.update_wrapper(dict.__new__(cls), func)
         self.pending = set()
         self.generics = []
+        if strict_containers is not None:
+            self.strict_containers = strict_containers
         return self
 
-    def __init__(self, func: Callable):
+    def __init__(
+        self,
+        func: Callable = _missing_func,
+        strict_containers: bool | None = None,
+    ):
+        if func is _missing_func:
+            return
+        if strict_containers is not None:
+            self.strict_containers = strict_containers
         try:
             self[signature.from_hints(func)] = func
         except (NameError, AttributeError):
@@ -369,7 +551,14 @@ class multimethod(dict):
         types = tuple(map(type, args))
         if not any(map(issubclass, types, self.generics)):
             return self[types]
-        matches = {key for key in list(self) if isinstance(key, signature) and key.instances(*args)}
+        instance_check = signature.instances
+        if getattr(self, "strict_containers", False):
+            instance_check = signature.strict_instances
+        matches = {
+            key
+            for key in list(self)
+            if isinstance(key, signature) and instance_check(key, *args)
+        }
         matches -= {ancestor for match in matches for ancestor in match.parents}
         return self.select(types, matches)
 
@@ -410,10 +599,27 @@ class multidispatch(multimethod, dict[tuple[type, ...], Callable[..., RETURN]]):
 
     signatures: dict[tuple, inspect.Signature]
 
-    def __new__(cls, func: Callable[..., RETURN]) -> "multidispatch[RETURN]":
-        return functools.update_wrapper(dict.__new__(cls), func)  # type: ignore
+    def __new__(
+        cls,
+        func: Callable[..., RETURN] = _missing_func,
+        strict_containers: bool | None = None,
+    ) -> "multidispatch[RETURN]":
+        if func is _missing_func:
+            return lambda wrapped: cls(wrapped, strict_containers=strict_containers)
+        self = functools.update_wrapper(dict.__new__(cls), func)  # type: ignore
+        if strict_containers is not None:
+            self.strict_containers = strict_containers
+        return self
 
-    def __init__(self, func: Callable[..., RETURN]) -> None:
+    def __init__(
+        self,
+        func: Callable[..., RETURN] = _missing_func,
+        strict_containers: bool | None = None,
+    ) -> None:
+        if func is _missing_func:
+            return
+        if strict_containers is not None:
+            self.strict_containers = strict_containers
         self.pending = set()
         self.generics = []
         self.signatures = {}

@@ -69,6 +69,18 @@ Multimethods support any types that satisfy the `issubclass` relation, including
 
 Naturally checking subscripts is slower, but the implementation is optimized, cached, and bypassed if no subscripts are in use in the parameter. Empty iterables match any subscript, but don't special-case how the types are normally resolved.
 
+For inputs where elements can change between calls, pass `strict_containers=True` to check all elements of materialized `list`, `tuple`, `dict`, and `set` values on every dispatch:
+
+```python
+@multimethod(strict_containers=True)
+def func(arg: list[int]): ...
+```
+
+Strict mode does not cache conclusions based on container contents, so mutating and reusing an object rechecks it.
+An empty container has no element evidence; when remaining generic signatures are not statically ordered, dispatch raises `DispatchError` rather than choosing a registration.
+Iterators and generators are not consumed: parameterized `Iterator[...]` checks fail, while their unparameterized runtime type can still be matched by another method.
+Recursive type aliases and self-referential containers terminate by treating a repeated object/type pair as a recursive match; a non-recursive parameter does not accept the self-reference.
+
 Dispatch resolution details:
 * If an exact match isn't registered, the next closest method is called (and cached).
 * If there are ambiguous methods - or none - a custom `TypeError` is raised.

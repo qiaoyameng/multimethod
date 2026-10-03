@@ -1,5 +1,6 @@
-from collections.abc import Iterable
+import sys
 from concurrent import futures
+from collections.abc import Iterable, Mapping, Sequence
 
 import pytest
 
@@ -130,3 +131,160 @@ def test_concurrency():
     args = [type("", (int,), {})() for _ in range(500)]
     fs = [submit(func, arg) for arg in args]
     assert all(future.result() is None for future in fs)
+
+
+def test_strict_containers():
+    @multimethod(strict_containers=True)
+    def func(arg):
+        return "object"
+
+    @func.register
+    def _(arg: list[int]):
+        return "int"
+
+    @func.register
+    def _(arg: list[str]):
+        return "str"
+
+    @func.register
+    def _(arg: list[int | str]):
+        return "mixed"
+
+    @func.register
+    def _(arg: tuple[int, str]):
+        return "tuple"
+
+    @func.register
+    def _(arg: tuple[bool, ...]):
+        return "bools"
+
+    @func.register
+    def _(arg: dict[str, int | str]):
+        return "dict"
+
+    @func.register
+    def _(arg: set[int | str]):
+        return "set"
+
+    @func.register
+    def _(arg: Sequence[float]):
+        return "floats"
+
+    assert func([0, 1]) == "int"
+    assert func(["a", "b"]) == "str"
+    assert func([0, "a"]) == "mixed"
+    assert func([0, 1.0]) == "object"
+    with pytest.raises(DispatchError, match="3 methods"):
+        func([])
+    assert func((0, "a")) == "tuple"
+    assert func((0, "a", ())) == "object"
+    assert func((True, False)) == "bools"
+    assert func((True, 0)) == "object"
+    assert func({"a": 0, "b": "c"}) == "dict"
+    assert func({0: 0}) == "object"
+    assert func({0, "a"}) == "set"
+    assert func({0, "a", b"x"}) == "object"
+    assert func(iter([0])) == "object"
+    assert func(value for value in [0]) == "object"
+    assert func((True, "a")) == "tuple"
+    assert func((0.0, 1.0)) == "floats"
+
+    reused = [0]
+    assert func(reused) == "int"
+    reused[0] = "a"
+    assert func(reused) == "str"
+
+
+def test_strict_nested_union_and_empty_containers():
+    @multimethod(strict_containers=True)
+    def func(
+        arg: list[int | str]
+        | Mapping[str, list[int | None]]
+        | tuple[list[int], ...],
+    ):
+        return "matched"
+
+    @func.register
+    def _(arg: list[float] | dict[str, list[bool]] | tuple[list[float], ...]):
+        return "other"
+
+    assert func([0, "a"]) == "matched"
+    assert func([0.0, 1.0]) == "other"
+    assert func({"a": [0, None], "b": []}) == "matched"
+    assert func({"a": [0, None], "b": [None]}) == "matched"
+    with pytest.raises(DispatchError, match="0 methods"):
+        func({"a": [1.0]})
+    with pytest.raises(DispatchError, match="0 methods"):
+        func({0: [0]})
+    assert func(([0, 1], [2, 3])) == "matched"
+    assert func(([0.0],)) == "other"
+    with pytest.raises(DispatchError, match="2 methods"):
+        func([])
+    with pytest.raises(DispatchError, match="2 methods"):
+        func({})
+    with pytest.raises(DispatchError, match="2 methods"):
+        func(())
+    with pytest.raises(DispatchError, match="2 methods"):
+        func({"a": []})
+
+
+def test_strict_recursive_containers():
+    @multimethod(strict_containers=True)
+    def func(arg: list[int]):
+        return "ints"
+
+    @func.register
+    def _(arg: dict[str, str]):
+        return "strings"
+
+    recursive_list = []
+    recursive_list.append(recursive_list)
+    recursive_dict = {}
+    recursive_dict["a"] = recursive_dict
+    with pytest.raises(DispatchError):
+        func(recursive_list)
+    with pytest.raises(DispatchError):
+        func(recursive_dict)
+
+    if (3, 12) <= sys.version_info:
+        namespace = {}
+        exec(
+            """
+type Json = int | list[Json]
+
+
+def values(arg: Json):
+    return arg
+""",
+            namespace,
+        )
+        json_func = multimethod(namespace["values"], strict_containers=True)
+        assert json_func([0, [1, []]]) == [0, [1, []]]
+        with pytest.raises(DispatchError):
+            json_func([0, ["a"]])
+        recursive_json = []
+        recursive_json.append(recursive_json)
+        assert json_func(recursive_json) is recursive_json
+
+
+def test_strict_multidispatch_keywords():
+    @multidispatch(strict_containers=True)
+    def func(arg):
+        return "object"
+
+    @func.register
+    def _(arg: list[int]):
+        return "int"
+
+    @func.register
+    def _(arg: list[str]):
+        return "str"
+
+    assert func(arg=[0]) == "int"
+    assert func(arg=["a"]) == "str"
+    with pytest.raises(DispatchError, match="2 methods"):
+        func(arg=[])
+    reused = [0]
+    assert func(arg=reused) == "int"
+    reused[0] = "a"
+    assert func(arg=reused) == "str"
