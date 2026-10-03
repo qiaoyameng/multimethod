@@ -299,6 +299,32 @@ class multimethod(dict):
     def __get__(self, instance, owner):
         return self if instance is None else types.MethodType(self, instance)
 
+    def __set_name__(self, owner, name):
+        """Inherit and extend same-named multimethods of base classes.
+
+        When a class body defines a multimethod whose name matches an inherited one,
+        the new multimethod is a local extension: at class creation it merges copies of
+        all inherited registries, so the subclass dispatches to inherited methods as well
+        as its own, without mutating any base class registry (siblings are unaffected).
+
+        Merge rules:
+            * the subclass's own registrations take precedence on identical signatures
+            * inherited registries are merged in MRO order; on a signature conflict
+              between different bases (e.g. a diamond), the first in MRO order wins
+            * each ancestor's registry is collected only once
+
+        The merge is a snapshot taken when the class is created. Registering new methods
+        on a base class afterwards does not affect existing subclasses, keeping each
+        class's dispatch cache consistent with its own registry.
+        """
+        for cls in owner.__mro__[1:]:
+            inherited = vars(cls).get(name)
+            if isinstance(inherited, multimethod) and inherited is not self:
+                for key, func in inherited.items():
+                    if isinstance(key, signature) and key not in self:
+                        self[key] = func
+                self.pending |= inherited.pending
+
     def parents(self, types: tuple) -> set:
         """Find immediate parents of potential key."""
         parents = {key for key in list(self) if isinstance(key, signature) and key.subtypes(*types)}

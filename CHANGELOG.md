@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
+### Added
+* Multimethods are locally extended in subclasses: same-named definitions inherit the
+  base registry (merged in MRO order at class creation) without mutating base classes
 
 ## [2.1](https://pypi.org/project/multimethod/2.1/) - 2026-07-28
 ### Changed

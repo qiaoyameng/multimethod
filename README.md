@@ -123,7 +123,8 @@ class Cls:
     meth = classmethod(meth)  # done with registering
 ```
 
-If a method spans multiple classes, then the namespace lookup can not work. The `register` method can be used instead.
+### subclassing
+A multimethod may be extended in a subclass simply by defining same-named multimethods in the class body. The subclass gets its own registry: it inherits the base class's registered methods and adds its own, without mutating any base class registry (sibling classes are unaffected).
 
 ```python
 class Base:
@@ -132,23 +133,24 @@ class Base:
 
 
 class Subclass(Base):
-    @Base.meth.register
-    def _(self, arg: int): ...
+    @multimethod
+    def meth(self, arg: int): ...  # `arg: str` is still dispatched to `Base.meth`
 ```
 
-If the base class can not be modified, the decorator - like any - can be called explicitly.
+Each class owns its registry, which is merged once when the class is created:
+* the subclass's own functions take precedence on identical signatures
+* with multiple inheritance, registries are merged in MRO order - each ancestor is collected once, and a signature conflict between different bases is won by the first in MRO order
+* the merge is a snapshot: registering on a base class _after_ the subclass is created does not affect the subclass, keeping each class's dispatch cache consistent with its own registry
 
-```python
-class Subclass(Base):
-    meth = multimethod(Base.meth)
-    ...
-```
+Class access (`Subclass.meth`), instance access, and `super()` follow normal attribute resolution: `super()` dispatches via the base class's own registry.
 
 `multimeta` creates a class with a special namespace which converts callables to multimethods, and registers duplicate callables with the original.
 
 ```python
 class Cls(metaclass=multimeta): ...  # all methods are multimethods
 ```
+
+Subclassing works the same way: redefining a method in a `multimeta` subclass locally extends the inherited multimethod.
 
 ## Installation
 ```console
