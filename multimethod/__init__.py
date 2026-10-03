@@ -49,7 +49,13 @@ class subtype(abc.ABCMeta):
             case typing.NewType():
                 return cls(tp.__supertype__)
             case TypeVar():
-                return cls(Union[tp.__constraints__]) if tp.__constraints__ else object
+                limit = (
+                    cls(Union[tp.__constraints__])
+                    if tp.__constraints__
+                    else cls(tp.__bound__) if tp.__bound__ is not None else object
+                )
+                namespace = {"__typevar__": tp, "__origin__": limit, "__args__": ()}
+                return type.__new__(cls, str(tp), (limit,), namespace)
             case typing._AnnotatedAlias():
                 return cls(tp.__origin__)
             case TypeAliasType():
@@ -78,6 +84,8 @@ class subtype(abc.ABCMeta):
         return type.__new__(cls, str(tp), bases, namespace)
 
     def key(self) -> tuple:
+        if getattr(self, "__typevar__", None) is not None:
+            return ("typevar", self.__typevar__)
         return self.__origin__, *self.__args__
 
     def __eq__(self, other) -> bool:
@@ -86,7 +94,30 @@ class subtype(abc.ABCMeta):
     def __hash__(self):
         return hash(self.key())
 
+    def limit(self):
+        limit = self.__origin__
+        while getattr(limit, "__typevar__", None) is not None:
+            limit = limit.__origin__
+        return limit
+
     def __subclasscheck__(self, subclass):
+        typevar = getattr(self, "__typevar__", None)
+        if typevar is not None:
+            other = getattr(subclass, "__typevar__", None)
+            if other is not None:
+                return other is typevar
+            limit = self.limit()
+            subclass_origin = get_origin(subclass)
+            if subclass_origin in (typing.Union, types.UnionType):
+                return all(issubclass(arg, limit) for arg in get_args(subclass))
+            key = (id(self), id(subclass))
+            if key in TYPEVAR_SUBCLASS_CHECKS:
+                return isinstance(limit, type) and limit in getattr(subclass, "__mro__", ())
+            TYPEVAR_SUBCLASS_CHECKS.add(key)
+            try:
+                return issubclass(subclass, limit)
+            finally:
+                TYPEVAR_SUBCLASS_CHECKS.discard(key)
         args = get_args(subclass)
         match origin := get_origin(subclass):
             case None:
@@ -121,6 +152,8 @@ class subtype(abc.ABCMeta):
         )
 
     def __instancecheck__(self, instance):
+        if getattr(self, "__typevar__", None) is not None:
+            return isinstance(instance, self.limit())
         match self.__origin__:
             case typing.Literal:
                 return any(type(arg) is type(instance) and arg == instance for arg in self.__args__)
@@ -158,6 +191,10 @@ class subtype(abc.ABCMeta):
 
         Provisional custom usage: `subtype.origins.register(<metaclass>, lambda cls: ...)
         """
+        if getattr(self, "__typevar__", None) is not None:
+            origins = list(subtype.origins(self.limit()))
+            yield from origins or (object,)
+            return
         match origin := get_origin(self):
             case typing.Literal:
                 yield from set(map(type, self.__args__))
@@ -209,6 +246,150 @@ class parametric(abc.ABCMeta):
 subtype.origins.register(parametric, lambda cls: cls.__bases__)
 
 
+def typevar(tp):
+    return getattr(tp, "__typevar__", None)
+
+
+TYPEVAR_SUBCLASS_CHECKS: set[tuple[int, int]] = set()
+
+
+def generic_origin(tp):
+    origin = get_origin(tp)
+    origins = (builtins.tuple, builtins.list, builtins.dict, builtins.type)
+    return origin if origin in origins else None
+
+
+def contains_typevar(tp) -> bool:
+    if typevar(tp) is not None:
+        return True
+    origin = generic_origin(tp)
+    return origin is not None and any(
+        arg is not Ellipsis and contains_typevar(arg) for arg in get_args(tp)
+    )
+
+
+def reconstruct(origin, args):
+    if origin is builtins.tuple:
+        return subtype(tuple[args])
+    if origin is builtins.list:
+        return subtype(list[args[0]])
+    if origin is builtins.dict:
+        return subtype(dict[args[0], args[1]])
+    return subtype(type[args[0]])
+
+
+def upper_type(tp):
+    tv = typevar(tp)
+    if tv is not None:
+        if tv.__constraints__:
+            return subtype(Union[tv.__constraints__])
+        return subtype(tv.__bound__) if tv.__bound__ is not None else object
+    origin = generic_origin(tp)
+    if origin is None:
+        return tp
+    return reconstruct(
+        origin,
+        tuple(Ellipsis if arg is Ellipsis else upper_type(arg) for arg in get_args(tp)),
+    )
+
+
+def bind_type(annotation, arg, bindings: dict, as_type=False) -> bool:
+    tv = typevar(annotation)
+    if tv is not None:
+        allowed = issubclass(arg, annotation.limit()) if as_type else isinstance(arg, annotation)
+        if not allowed:
+            return False
+        actual = arg if as_type else type(arg)
+        previous = bindings.get(tv)
+        if previous is None:
+            bindings[tv] = actual
+            return True
+        return previous is actual
+    origin = generic_origin(annotation)
+    if origin is builtins.type:
+        return isinstance(arg, type) and bind_type(
+            get_args(annotation)[0], arg, bindings, as_type=True
+        )
+    if origin is builtins.tuple:
+        if not isinstance(arg, tuple):
+            return False
+        if not contains_typevar(annotation):
+            return isinstance(arg, annotation)
+        args = get_args(annotation)
+        if Ellipsis in args:
+            return all(bind_type(args[0], item, bindings) for item in arg)
+        return len(args) == len(arg) and all(
+            map(bind_type, args, arg, itertools.repeat(bindings))
+        )
+    if origin is builtins.list:
+        if not isinstance(arg, list):
+            return False
+        if not contains_typevar(annotation):
+            return isinstance(arg, annotation)
+        return all(bind_type(get_args(annotation)[0], item, bindings) for item in arg)
+    if origin is builtins.dict:
+        if not isinstance(arg, dict) or not contains_typevar(annotation):
+            return isinstance(arg, annotation)
+        return all(
+            bind_type(get_args(annotation)[0], key, bindings)
+            and bind_type(get_args(annotation)[1], value, bindings)
+            for key, value in arg.items()
+        )
+    return isinstance(arg, annotation)
+
+
+def substitute_type(tp, bindings: dict):
+    tv = typevar(tp)
+    if tv is not None:
+        return bindings.get(tv, upper_type(tp))
+    origin = generic_origin(tp)
+    if origin is None:
+        return tp
+    return reconstruct(
+        origin,
+        tuple(
+            Ellipsis if arg is Ellipsis else substitute_type(arg, bindings)
+            for arg in get_args(tp)
+        ),
+    )
+
+
+def cacheable_type(tp) -> bool:
+    tv = typevar(tp)
+    if tv is not None:
+        return cacheable_type(tp.limit()) if isinstance(tp.limit(), subtype) else True
+    origin = get_origin(tp)
+    if origin in (typing.Union, types.UnionType):
+        return all(cacheable_type(arg) for arg in get_args(tp))
+    if origin is typing.Literal or isinstance(tp, parametric):
+        return False
+    if origin is generic_origin(tp):
+        return all(arg is Ellipsis or cacheable_type(arg) for arg in get_args(tp))
+    return origin is None
+
+
+def evidence(arg, seen: dict):
+    arg_id = id(arg)
+    if arg_id in seen:
+        return ("cycle", arg_id)
+    if isinstance(arg, (tuple, list, dict)):
+        seen[arg_id] = None
+        if isinstance(arg, dict):
+            items = frozenset(
+                (evidence(key, seen), evidence(value, seen)) for key, value in arg.items()
+            )
+        else:
+            items = tuple(evidence(item, seen) for item in arg)
+        return (type(arg), items)
+    if isinstance(arg, type):
+        return (type, arg)
+    return type(arg)
+
+
+class generic_key(tuple):
+    """A cache key which includes runtime evidence for generic arguments."""
+
+
 class signature(tuple):
     """A tuple of types that supports partial ordering."""
 
@@ -253,6 +434,16 @@ class signature(tuple):
         """Return whether all arguments are instances."""
         return self.required <= len(args) and all(map(isinstance, args, self))
 
+    def bind_instances(self, *args) -> dict | None:
+        """Bind TypeVars shared by this signature to one set of arguments."""
+        if self.required > len(args):
+            return None
+        bindings: dict = {}
+        for annotation, arg in zip(self, args):
+            if not bind_type(annotation, arg, bindings):
+                return None
+        return bindings
+
 
 REGISTERED = TypeVar("REGISTERED", bound=Callable[..., Any])
 
@@ -272,6 +463,8 @@ class multimethod(dict):
         self = functools.update_wrapper(dict.__new__(cls), func)
         self.pending = set()
         self.generics = []
+        self.typevars = set()
+        self.cacheable = True
         return self
 
     def __init__(self, func: Callable):
@@ -313,16 +506,30 @@ class multimethod(dict):
 
     def copy(self):
         """Return a new multimethod with the same methods."""
-        return dict.__new__(type(self)).__ior__(self)
+        other = dict.__new__(type(self))
+        dict.__ior__(other, self)
+        other.pending = set(self.pending)
+        other.generics = self.generics.copy()
+        other.typevars = set(self.typevars)
+        other.cacheable = self.cacheable
+        functools.update_wrapper(other, self)
+        return other
 
     def __setitem__(self, types: tuple, func: Callable):
         self.clean()
         if not isinstance(types, signature):
             types = signature(types)
+        dict.pop(self, types, None)
+        if any(contains_typevar(tp) for tp in types):
+            self.typevars.add(types)
+        self.cacheable = all(
+            all(cacheable_type(tp) for tp in key)
+            for key in [*self, types]
+            if isinstance(key, signature)
+        )
         parents = types.parents = self.parents(types)
         with contextlib.suppress(ValueError):
             types.sig = inspect.signature(func)
-        self.pop(types, None)  # ensure key is overwritten
         for key in self:
             if types.subtypes(*key) and (not parents or parents & key.parents):
                 key.parents -= parents
@@ -337,6 +544,12 @@ class multimethod(dict):
     def __delitem__(self, types: tuple):
         self.clean()
         super().__delitem__(types)
+        self.typevars.discard(types)
+        self.cacheable = all(
+            all(cacheable_type(tp) for tp in key)
+            for key in self
+            if isinstance(key, signature)
+        )
         for key in self:
             if types in key.parents:
                 key.parents = self.parents(key)
@@ -364,9 +577,75 @@ class multimethod(dict):
             return self[types]
         return self.setdefault(types, self.select(types, self.parents(types)))
 
+    @staticmethod
+    def issubtype(subtype_type, supertype_type) -> bool:
+        try:
+            return issubclass(subtype_type, supertype_type)
+        except TypeError:
+            return False
+
+    def candidates(self, args, types: tuple) -> set[tuple[signature, tuple, tuple, tuple]]:
+        candidates = set()
+        for key in list(self):
+            if not isinstance(key, signature) or not key.callable(*types):
+                continue
+            bindings = key.bind_instances(*args)
+            if bindings is None:
+                continue
+            resolved = tuple(substitute_type(tp, bindings) for tp in key[: len(types)])
+            upper = tuple(upper_type(tp) for tp in key[: len(types)])
+            candidates.add((key, resolved, upper, tuple(bindings.items())))
+        return candidates
+
+    @staticmethod
+    def dominates(left, right) -> bool:
+        _, left_resolved, left_upper, _ = left
+        _, right_resolved, right_upper, _ = right
+        if len(left_resolved) != len(right_resolved):
+            return len(left_resolved) > len(right_resolved)
+        if not all(map(multimethod.issubtype, left_resolved, right_upper)):
+            return False
+        left_narrower = map(multimethod.issubtype, left_resolved, right_resolved)
+        right_narrower = map(multimethod.issubtype, right_resolved, left_resolved)
+        if all(left_narrower) and not all(right_narrower):
+            return True
+        if not all(left_narrower) or not all(right_narrower):
+            return False
+        left_static = map(multimethod.issubtype, left_upper, right_upper)
+        right_static = map(multimethod.issubtype, right_upper, left_upper)
+        return all(left_static) and not all(right_static)
+
+    def dispatch_typevars(self, args, types: tuple) -> Callable:
+        candidates = self.candidates(args, types)
+        while True:
+            for candidate in tuple(candidates):
+                dominated = any(
+                    other is not candidate and self.dominates(other, candidate)
+                    for other in candidates
+                )
+                if dominated:
+                    candidates.remove(candidate)
+                    break
+            else:
+                break
+        return self.select(types, {candidate[0] for candidate in candidates})
+
     def dispatch(self, *args) -> Callable:
         self.evaluate()
         types = tuple(map(type, args))
+        if self.typevars:
+            if self.cacheable:
+                key = generic_key((*types, tuple(evidence(arg, {}) for arg in args)))
+                if dict.__contains__(self, key):
+                    return dict.__getitem__(self, key)
+            func = self.dispatch_typevars(args, types)
+            if self.cacheable:
+                dict.__setitem__(
+                    self,
+                    generic_key((*types, tuple(evidence(arg, {}) for arg in args))),
+                    func,
+                )
+            return func
         if not any(map(issubclass, types, self.generics)):
             return self[types]
         matches = {key for key in list(self) if isinstance(key, signature) and key.instances(*args)}
@@ -416,6 +695,8 @@ class multidispatch(multimethod, dict[tuple[type, ...], Callable[..., RETURN]]):
     def __init__(self, func: Callable[..., RETURN]) -> None:
         self.pending = set()
         self.generics = []
+        self.typevars = set()
+        self.cacheable = True
         self.signatures = {}
         self[()] = func
 

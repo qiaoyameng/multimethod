@@ -84,8 +84,8 @@ def test_subtype():
 @pytest.mark.benchmark
 def test_signature():
     assert signature([Any, list, NewType("", int)]) == (object, list, int)
-    assert signature([AnyStr]) == signature([bytes | str])
-    assert signature([TypeVar("T")]) == signature([object])
+    assert issubclass(bytes | str, signature([AnyStr])[0])
+    assert issubclass(object, signature([TypeVar("T")])[0])
     assert signature([list]).subtypes(list)
     assert signature([list]).subtypes(subtype(list[int]))
 

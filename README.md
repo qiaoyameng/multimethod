@@ -76,6 +76,45 @@ Dispatch resolution details:
 * A skipped annotation is equivalent to `: object`.
 * If no types are specified, it will inherently match all arguments.
 
+#### TypeVar unification
+
+Repeated `TypeVar`s in one overload share one candidate-local binding. A candidate is considered only when every occurrence unifies to the same concrete runtime type. A failed binding is discarded before another candidate is tried, so it never leaves constraints behind.
+
+* An unconstrained `T` is first checked against `object`; repeated occurrences must then have exactly the same runtime type.
+* A `bound` is checked normally, but repeated occurrences still require the same concrete type.
+* Every constraint is checked with ordinary subclass rules, after which the matching concrete runtime type must be identical.
+* `bool` is a subtype of `int`, so `bool` satisfies an `int` bound or constraint. Unifying one occurrence to `bool` and another to `int` still fails.
+* Parent and child instances are similarly accepted by the bound only; repeated unconstrained variables do not coerce a child to its parent.
+* Empty `tuple`, `list`, or `dict` positions provide no type evidence. The variable stays unbound there, and an empty parameterized container can still match a concrete parameterized overload.
+* Nested variables in `tuple`, `list`, `dict`, and `type[...]` are inferred from their contents or class argument. `tuple[T, ...]` requires every element to unify with the same `T`.
+
+```python
+from typing import TypeVar
+
+from multimethod import multimethod
+
+T = TypeVar("T")
+
+@multimethod
+def merge(left, right):
+    return "object"
+
+@merge.register
+def _(left: T, right: T):
+    return "same"
+
+@merge.register
+def _(left: int, right: int):
+    return "int"
+
+merge(1, 2)          # int: concrete int,int is more specific than T=int
+merge(True, False)   # same: bool,bool unifies but has no bool overload
+merge(True, 1)       # int: the concrete int,int overload accepts bool
+merge(1, 1.0)        # object: int and float do not unify
+```
+
+After a TypeVar candidate unifies, it is compared with ordinary concrete overloads using the resolved signature. If the candidates remain equally specific, the usual ambiguity error is reported rather than silently choosing the generic overload. TypeVar dispatch caches a content-derived key in addition to the runtime types, so `[0]`, `[False]`, and `[]` retain separate results.
+
 ### multidispatch
 `multidispatch` is a wrapper to provide compatibility with `functools.singledispatch`. It requires a base implementation and use of the `register` method instead of namespace lookup. It also supports dispatching on keyword arguments.
 
