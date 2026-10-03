@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
+### Changed
+* `multidispatch` binds every candidate signature, supporting positional-only,
+  keyword-only, default and variadic arguments for keyword dispatch
+* Cached lookups distinguish bound argument shapes (not keyword iteration order)
+* A `TypeError` raised inside a dispatched function propagates unchanged instead
+  of being wrapped as a dispatch error
 
 ## [2.1](https://pypi.org/project/multimethod/2.1/) - 2026-07-28
 ### Changed

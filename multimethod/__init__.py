@@ -215,16 +215,28 @@ class signature(tuple):
     required: int
     parents: set
     sig: inspect.Signature
+    identity: tuple | None
+    fallback: bool
 
     def __new__(cls, types: Iterable, required: int | None = None):
         return tuple.__new__(cls, map(subtype, types))
 
     def __init__(self, types: Iterable, required: int | None = None):
         self.required = len(self) if required is None else required
+        self.identity = None
+        self.fallback = False
 
     @classmethod
-    def from_hints(cls, func: Callable) -> Self:
-        """Return evaluated type hints for positional parameters in order."""
+    def of(cls, func: Callable) -> Self:
+        """Return a signature describing all parameters of ``func``.
+
+        Positional parameter types remain the tuple contents, preserving the
+        partial ordering used for pure positional dispatch.  The ``identity``
+        additionally records the binding shape (parameter names, kinds, default
+        presence and types, including keyword-only and variadic parameters), so
+        that signatures which share positional types but differ in how
+        arguments can bind remain distinct candidates.
+        """
         if not hasattr(func, "__annotations__"):
             return cls(())
         type_hints = get_type_hints(func)
@@ -236,7 +248,135 @@ class signature(tuple):
         params = params[: max(indices, default=-1) + 1]
         hints = [type_hints.get(param.name, object) for param in params]
         required = sum(param.default is param.empty for param in params)
-        return cls(hints, required)
+        types = cls(hints, required)
+        types.describe(func, type_hints)
+        return types
+
+    @classmethod
+    def from_hints(cls, func: Callable) -> Self:
+        """Return evaluated type hints for positional parameters in order."""
+        return cls.of(func)
+
+    def describe(self, func: Callable, type_hints: dict | None = None):
+        """Attach the concrete signature and the full binding-shape identity."""
+        with contextlib.suppress(ValueError):
+            self.sig = inspect.signature(func)
+        sig = getattr(self, "sig", None)
+        if sig is None:
+            return self
+        if type_hints is None:
+            try:
+                type_hints = get_type_hints(func)
+            except Exception:
+                type_hints = {}
+        positionals = (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+        )
+        info = []
+        positional_index = 0
+        for param in sig.parameters.values():
+            if param.kind not in positionals[:2] or positional_index >= len(self):
+                cls = subtype(type_hints.get(param.name, object))
+            else:
+                cls = tuple.__getitem__(self, positional_index)
+            if param.kind in positionals[:2]:
+                positional_index += 1
+            default = None if param.default is param.empty else param.default
+            info.append((param.name, param.kind, default, cls))
+        self.identity = tuple(info)
+        return self
+
+    def param_types(self, bound: inspect.BoundArguments):
+        """Return declared ``(positional, keyword)`` type vectors for a binding.
+
+        Defaults are applied first by the caller, so declared defaults for
+        omitted parameters produce positional entries just like explicit ones.
+        Positional-or-keyword parameters always occupy positional slots
+        (``BoundArguments`` normalizes keyword calls for them), so equivalent
+        positional and keyword calls produce identical vectors.  Keyword-only
+        and variadic-keyword entries land in the keyword vector.
+        """
+        info = self.identity or ()
+        by_name = {item[0]: item for item in info}
+        pos_types: list = []
+        for name, value in bound.arguments.items():
+            item = by_name.get(name)
+            if item is None:
+                continue
+            _, kind, _, cls = item
+            if kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                pos_types.append(cls)
+            elif kind == inspect.Parameter.VAR_POSITIONAL:
+                pos_types.extend([cls] * len(value))
+        keyword = {}
+        var_keyword = next(
+            (cls for name, kind, _, cls in self.identity if kind == inspect.Parameter.VAR_KEYWORD),
+            object,
+        )
+        for name, value in bound.arguments.items():
+            item = by_name.get(name)
+            if item is not None and item[1] == inspect.Parameter.VAR_KEYWORD:
+                keyword.update({sub_name: item[3] for sub_name in value})
+                continue
+            if item is None:
+                keyword[name] = var_keyword
+            elif item[1] == inspect.Parameter.KEYWORD_ONLY:
+                keyword[name] = item[3]
+        return pos_types, keyword
+
+    def explicit(self, raw_bound: inspect.BoundArguments) -> tuple[int, set]:
+        """Return ``(positional slots, keyword names)`` supplied by the call.
+
+        Computed before defaults are applied, so omitted parameters and their
+        declared defaults are distinguished from explicit arguments.
+        """
+        by_name = {item[0]: item for item in (self.identity or ())}
+        positional = 0
+        keyword = set()
+        for name, value in raw_bound.arguments.items():
+            item = by_name.get(name)
+            if item is None:
+                continue
+            kind = item[1]
+            if kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                positional += 1
+            elif kind == inspect.Parameter.VAR_POSITIONAL:
+                positional += len(value)
+            elif kind == inspect.Parameter.KEYWORD_ONLY:
+                keyword.add(name)
+            elif kind == inspect.Parameter.VAR_KEYWORD:
+                keyword.update(value)
+        keyword.update(raw_bound.kwargs)
+        return positional, keyword
+
+    def check(self, bound: inspect.BoundArguments) -> bool:
+        """Check every bound value (including defaults) against declared types."""
+        pos_types, keyword = self.param_types(bound)
+        if len(pos_types) != len(bound.args):
+            return False
+        values = itertools.chain(bound.args, (bound.arguments[name] for name in sorted(keyword)))
+        types = itertools.chain(pos_types, (keyword[name] for name in sorted(keyword)))
+        pairs = zip(values, types)
+        return all(isinstance(value, cls) for value, cls in pairs)
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, tuple) or len(self) != len(other) or not tuple.__eq__(self, other):
+            return False
+        identity = getattr(other, "identity", None)
+        if self.identity is None or identity is None:
+            return True
+        return self.identity == identity
+
+    def __hash__(self):
+        return hash((tuple(self), self.identity))
 
     def subtypes(self, *other) -> bool:
         """Return whether all types are subclasses."""
@@ -299,6 +439,59 @@ class multimethod(dict):
     def __get__(self, instance, owner):
         return self if instance is None else types.MethodType(self, instance)
 
+    def lookup(self, types: tuple):
+        """Find a registered signature equal to ``types`` by positional types."""
+        return next(
+            (
+                key
+                for key in list(self)
+                if isinstance(key, signature) and tuple(key) == tuple(types)
+            ),
+            None,
+        )
+
+    def __getitem__(self, types: tuple):
+        if isinstance(types, signature):
+            try:
+                return dict.__getitem__(self, types)
+            except KeyError:
+                return self.__missing__(types)
+        hit = dict.get(self, types)  # cached plain-tuple lookup
+        if hit is not None:
+            return hit
+        key = self.lookup(types)
+        if key is not None:
+            return dict.__getitem__(self, key)
+        return self.__missing__(types)
+
+    def get(self, key, default=None):
+        if isinstance(key, signature):
+            return dict.get(self, key, default)
+        hit = dict.get(self, key)
+        if hit is not None:
+            return hit
+        found = self.lookup(key)
+        return dict.__getitem__(self, found) if found is not None else default
+
+    def pop(self, key, *default):
+        if not isinstance(key, signature):
+            found = dict.get(self, key)
+            if found is None:
+                registered = self.lookup(key)
+            else:
+                registered = key
+            if registered is None:
+                if default:
+                    return default[0]
+                raise KeyError(key)
+            key = registered
+        return dict.pop(self, key, *default)
+
+    def __contains__(self, key) -> bool:
+        if isinstance(key, signature):
+            return dict.__contains__(self, key)
+        return self.lookup(key) is not None
+
     def parents(self, types: tuple) -> set:
         """Find immediate parents of potential key."""
         parents = {key for key in list(self) if isinstance(key, signature) and key.subtypes(*types)}
@@ -313,16 +506,23 @@ class multimethod(dict):
 
     def copy(self):
         """Return a new multimethod with the same methods."""
-        return dict.__new__(type(self)).__ior__(self)
+        other = dict.__new__(type(self))
+        other.__ior__(self)
+        other.pending = set(self.pending)
+        other.generics = list(self.generics)
+        if hasattr(self, "call_cache"):
+            other.call_cache = dict(self.call_cache)
+        return functools.update_wrapper(other, self)
 
     def __setitem__(self, types: tuple, func: Callable):
         self.clean()
         if not isinstance(types, signature):
             types = signature(types)
         parents = types.parents = self.parents(types)
-        with contextlib.suppress(ValueError):
-            types.sig = inspect.signature(func)
-        self.pop(types, None)  # ensure key is overwritten
+        if getattr(types, "identity", None) is None:
+            with contextlib.suppress(Exception):
+                types.describe(func)
+        dict.pop(self, types, None)  # ensure identical key is overwritten
         for key in self:
             if types.subtypes(*key) and (not parents or parents & key.parents):
                 key.parents -= parents
@@ -336,7 +536,12 @@ class multimethod(dict):
 
     def __delitem__(self, types: tuple):
         self.clean()
-        super().__delitem__(types)
+        if not isinstance(types, signature):
+            key = self.lookup(types)
+            if key is None:
+                raise KeyError(types)
+            types = key
+        dict.__delitem__(self, types)
         for key in self:
             if types in key.parents:
                 key.parents = self.parents(key)
@@ -360,8 +565,9 @@ class multimethod(dict):
         """Find and cache the next applicable method of given types."""
         self.evaluate()
         types = tuple(map(subtype, types))
-        if types in self:
-            return self[types]
+        key = types if isinstance(types, signature) else self.lookup(types)
+        if key is not None:
+            return dict.__getitem__(self, key)
         return self.setdefault(types, self.select(types, self.parents(types)))
 
     def dispatch(self, *args) -> Callable:
@@ -379,13 +585,17 @@ class multimethod(dict):
         try:
             return func(*args, **kwargs)
         except TypeError as ex:
+            # a TypeError raised inside the function body propagates unchanged;
+            # only an error in the call itself is reported as a dispatch error
+            if ex.__traceback__ is not None and ex.__traceback__.tb_next is not None:
+                raise
             raise DispatchError(f"Function {func.__code__}") from ex
 
     def evaluate(self):
         """Evaluate any pending forward references."""
         while self.pending:
             func = self.pending.pop()
-            self[signature.from_hints(func)] = func
+            self[signature.of(func)] = func
 
     @property
     def docstring(self):
@@ -405,10 +615,33 @@ class multidispatch(multimethod, dict[tuple[type, ...], Callable[..., RETURN]]):
     """Wrapper for compatibility with `functools.singledispatch`.
 
     Only uses the `register` method instead of namespace lookup.
-    Allows dispatching on keyword arguments based on the first function signature.
+    Every candidate is bound with its own `inspect.Signature`, so positional-only,
+    keyword-only, default and variadic parameters are all part of candidate
+    selection; equivalent positional and keyword calls resolve identically.
     """
 
-    signatures: dict[tuple, inspect.Signature]
+    class callkey(tuple):
+        """Cache key capturing the bound argument shape.
+
+        Holds the types of positional arguments and name-sorted keyword
+        ``(name, type)`` pairs, which distinguishes bindings with the same
+        types but a different shape, independent of keyword iteration order.
+        """
+
+        def __new__(cls, args: tuple, kwargs: dict):
+            return tuple.__new__(
+                cls,
+                (
+                    tuple(map(type, args)),
+                    tuple(sorted((name, type(value)) for name, value in kwargs.items())),
+                ),
+            )
+
+        def __eq__(self, other):
+            return type(other) is type(self) and tuple.__eq__(self, other)
+
+        def __hash__(self):
+            return tuple.__hash__(self)
 
     def __new__(cls, func: Callable[..., RETURN]) -> "multidispatch[RETURN]":
         return functools.update_wrapper(dict.__new__(cls), func)  # type: ignore
@@ -416,28 +649,142 @@ class multidispatch(multimethod, dict[tuple[type, ...], Callable[..., RETURN]]):
     def __init__(self, func: Callable[..., RETURN]) -> None:
         self.pending = set()
         self.generics = []
-        self.signatures = {}
-        self[()] = func
+        self.call_cache = {}
+        base = signature(())
+        base.describe(func)
+        base.fallback = True
+        self[base] = func
 
     def __get__(self, instance, owner) -> Callable[..., RETURN]:
         return self if instance is None else types.MethodType(self, instance)
 
-    def __setitem__(self, types: tuple, func: Callable):
-        super().__setitem__(types, func)
-        with contextlib.suppress(ValueError):
-            signature = inspect.signature(func)
-            self.signatures.setdefault(tuple(signature.parameters), signature)
+    def clean(self):
+        self.call_cache.clear()
+        super().clean()
+
+    def select_call(self, args: tuple, kwargs: dict) -> Callable:
+        """Bind every candidate and pick the most specific applicable one."""
+        self.evaluate()
+        candidates = []
+        for key in list(self):
+            if not isinstance(key, signature):
+                continue
+            raw_bound = self.bind(key, args, kwargs)
+            if raw_bound is None:
+                continue
+            bound = raw_bound
+            bound.apply_defaults()
+            explicit_positions, explicit_kw = key.explicit(raw_bound)
+            base = getattr(key, "fallback", False)
+            if not base and not key.check(bound):
+                continue
+            pos_types, kw_types = key.param_types(bound)
+            candidates.append(
+                (
+                    key,
+                    self[key],
+                    pos_types,
+                    kw_types,
+                    explicit_positions,
+                    explicit_kw,
+                    base,
+                )
+            )
+        funcs = self.most_specific(candidates)
+        if len(funcs) == 1:
+            return funcs.pop()
+        types = (tuple(map(type, args)), tuple(sorted(kwargs)))
+        raise DispatchError(f"{self.__name__}: {len(funcs)} methods found", types, funcs)
+
+    @staticmethod
+    def bind(key: signature, args: tuple, kwargs: dict):
+        """Bind a candidate signature; return ``None`` when it cannot apply."""
+        sig = getattr(key, "sig", None)
+        if sig is None:
+            return None
+        try:
+            return sig.bind(*args, **kwargs)
+        except TypeError:
+            return None
+
+    @staticmethod
+    def most_specific(candidates) -> set:
+        """Return functions of candidates not strictly dominated by another.
+
+        Specificity mirrors pure positional multimethod resolution:
+        * only slots of arguments explicitly supplied by the call establish
+          strict specificity: declared defaults fill in for applicability but
+          do not let a longer signature win when an argument was omitted,
+        * a shorter positional signature is more specific (only common
+          positions are compared),
+        * keyword slots are compared by name for explicitly supplied keywords.
+        """
+        vectors = []
+        for _, func, pos, kw, n_args, explicit_kw, base in candidates:
+            vectors.append((func, pos, kw, n_args, explicit_kw, base))
+        # collapse equivalent shapes pointing at the same function object
+        unique = {}
+        for vector in vectors:
+            shape = (vector[0], tuple(vector[1]), tuple(sorted(vector[2])))
+            unique.setdefault(shape, vector)
+        vectors = list(unique.values())
+
+        def dominates(left, right) -> bool:
+            _, left_pos, left_kw, left_n_pos, left_explicit, left_base = left
+            _, right_pos, right_kw, right_n_pos, right_explicit, right_base = right
+            if not left_base and not right_base and len(left_pos) > len(right_pos):
+                return False
+            n_pos = min(left_n_pos, right_n_pos, len(left_pos), len(right_pos))
+            pos_pairs = tuple(zip(left_pos[:n_pos], right_pos[:n_pos]))
+            shared_kw = set(left_kw) & set(right_kw)
+            explicit_kw = left_explicit & right_explicit
+            pairs = pos_pairs + tuple(
+                (left_kw[name], right_kw[name]) for name in sorted(shared_kw)
+            )
+            if any(not (a is b or issubclass(a, b)) for a, b in pairs):
+                return False
+            stricter_slots = tuple(
+                (left_kw[name], right_kw[name]) for name in sorted(shared_kw & explicit_kw)
+            )
+            stricter = (
+                not left_base
+                and not right_base
+                and len(left_pos) < len(right_pos)
+            ) or any(a is not b for a, b in pos_pairs + stricter_slots)
+            return stricter
+
+        winners = set()
+        for index, candidate in enumerate(vectors):
+            dominated = False
+            for other, other_vector in enumerate(vectors):
+                if other == index or other_vector[0] is candidate[0]:
+                    continue
+                if dominates(other_vector, candidate):
+                    dominated = True
+                    break
+            if not dominated:
+                winners.add(candidate[0])
+        return winners
+
+    def dispatch_call(self, args: tuple, kwargs: dict) -> Callable:
+        """Resolve and cache the function for the given call shape."""
+        self.evaluate()
+        key = self.callkey(args, kwargs)
+        with contextlib.suppress(KeyError):
+            return self.call_cache[key]
+        func = self.select_call(args, kwargs)
+        self.call_cache[key] = func
+        return func
 
     def __call__(self, *args: Any, **kwargs: Any) -> RETURN:
         """Resolve and dispatch to best method."""
-        params = args
-        if kwargs:
-            for signature in self.signatures.values():  # pragma: no branch
-                with contextlib.suppress(TypeError):
-                    params = signature.bind(*args, **kwargs).args
-                    break
-        func = self.dispatch(*params)
-        return func(*args, **kwargs)
+        func = self.dispatch_call(args, kwargs)
+        try:
+            return func(*args, **kwargs)
+        except TypeError as ex:
+            if ex.__traceback__ is not None and ex.__traceback__.tb_next is not None:
+                raise
+            raise DispatchError(f"Function {func.__code__}") from ex
 
 
 class multimeta(type):

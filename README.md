@@ -19,7 +19,8 @@ There are a couple options which trade-off dispatch speed for flexibility.
 Decorator | Speed | Dispatch | Arguments
 --------- | ----- | -------- | ---------
 [multimethod](#multimethod) | faster | cached lookup | positional only
-[multidispatch](#multidispatch) | slower | binds to first signature + cached lookup | positional + keywords
+[multidispatch](#multidispatch) | slower | binds every signature + cached lookup | positional + keywords
+
 
 Dispatching on simple types which use `issubclass` is cached. Advanced types which use `isinstance` require a linear scan.
 
@@ -72,12 +73,12 @@ Naturally checking subscripts is slower, but the implementation is optimized, ca
 Dispatch resolution details:
 * If an exact match isn't registered, the next closest method is called (and cached).
 * If there are ambiguous methods - or none - a custom `TypeError` is raised.
-* Keyword-only parameters may be annotated, but won't affect dispatching.
+* Positional-only, keyword-only, default and variadic parameters are all supported.
 * A skipped annotation is equivalent to `: object`.
 * If no types are specified, it will inherently match all arguments.
 
 ### multidispatch
-`multidispatch` is a wrapper to provide compatibility with `functools.singledispatch`. It requires a base implementation and use of the `register` method instead of namespace lookup. It also supports dispatching on keyword arguments.
+`multidispatch` is a wrapper to provide compatibility with `functools.singledispatch`. It requires a base implementation and use of the `register` method instead of namespace lookup. Every candidate is bound with its own `inspect.Signature`, so positional, keyword and mixed calls resolve identically based on the bound argument values (including declared defaults). Signatures which cannot bind the call drop out of resolution; remaining candidates are ordered by type specificity, and equally specific candidates raise a dispatch error.
 
 ### instance checks
 `subtype` provisionally provides `isinstance` and `issubclass` checks for generic types. When called on a non-generic, it will return the origin type.

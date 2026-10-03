@@ -130,3 +130,224 @@ def test_concurrency():
     args = [type("", (int,), {})() for _ in range(500)]
     fs = [submit(func, arg) for arg in args]
     assert all(future.result() is None for future in fs)
+
+
+def test_keyword_binding_equivalence():
+    """Equivalent positional and keyword calls resolve identically."""
+
+    @multidispatch
+    def func(value, mode):
+        return "default"
+
+    @func.register
+    def _(value: int, mode: str):
+        return "int,str"
+
+    @func.register
+    def _(value: int, mode: float):
+        return "int,float"
+
+    for positional, keyword in (
+        ((1, "x"), {"value": 1, "mode": "x"}),
+        ((1, 1.0), {"value": 1, "mode": 1.0}),
+    ):
+        assert func(*positional) == func(**keyword)
+        assert func(positional[0], **{list(keyword)[-1]: positional[-1]}) == func(*positional)
+    assert func(1.0, "x") == func(value=1.0, mode="x") == "default"
+    # unbound shapes raise dispatch errors, not a bare binding TypeError
+    with pytest.raises(DispatchError, match="0 methods"):
+        func(value=1)
+
+
+def test_keyword_positional_only():
+    """A positional-only base still allows keyword calls via other candidates."""
+
+    def base(value, mode, /):
+        return "base"
+
+    func = multidispatch(base)
+
+    @func.register
+    def _(value: int, mode: str):
+        return "int,str"
+
+    assert func(1, "x") == func(value=1, mode="x") == "int,str"
+    # calling the base function directly still rejects keyword arguments
+    with pytest.raises(TypeError):
+        base(value=1, mode="x")
+
+
+def test_keyword_only_specialization():
+    @multidispatch
+    def func(x, *, mode):
+        return "base"
+
+    @func.register
+    def _(x: int, *, mode: str):
+        return "int+str"
+
+    @func.register
+    def _(x: int, *, mode: float):
+        return "int+float"
+
+    @func.register
+    def _(x: str, *, mode: str):
+        return "str+str"
+
+    assert func(1, mode="x") == func(x=1, mode="x") == "int+str"
+    assert func(x=1, mode=1.0) == "int+float"
+    assert func(x="a", mode="x") == "str+str"
+
+
+def test_keyword_defaults_participate():
+    """Declared defaults are bound and omitted args don't hit other shapes."""
+
+    @multidispatch
+    def func(a, b=2.0):
+        return ("base", b)
+
+    @func.register
+    def _(a: int, b: float = 2.0):
+        return ("int,float", b)
+
+    @func.register
+    def _(a: int):
+        return ("int-only",)
+
+    assert func(1) == func(a=1) == ("int-only",)
+    assert func(1, 2.0) == func(1, b=2.0) == func(a=1, b=2.0) == ("int,float", 2.0)
+    assert func(a="x") == ("base", 2.0)
+
+
+def test_keyword_shape_cache():
+    """Cache keys distinguish binding shapes and ignore kwarg order."""
+
+    @multidispatch
+    def func(a, b=0):
+        return "2-params"
+
+    @func.register
+    def _(a: int):
+        return "1-param"
+
+    @func.register
+    def _(a: int, b: int = 0):
+        return "2-int"
+
+    calls = [
+        ((1,), {}),
+        ((1, 2), {}),
+        ((), {"a": 1}),
+        ((), {"a": 1, "b": 2}),
+        ((1,), {"b": 2}),
+    ]
+    expected = ["1-param", "2-int", "1-param", "2-int", "2-int"]
+    for repeat in range(3):  # second+ iterations hit the cache
+        for (args, kwargs), result in zip(calls, expected):
+            assert func(*args, **kwargs) == result
+
+    @multidispatch
+    def ordered(x=1, y="a", z=3.0):
+        return "base"
+
+    @ordered.register
+    def _(x: int, y: str, z: float):
+        return "all"
+
+    assert ordered(x=1, y="a", z=2.0) == ordered(z=2.0, x=1, y="a") == "all"
+
+
+def test_keyword_ambiguity():
+    """Equally specific applicable candidates raise a dispatch error."""
+
+    @multidispatch
+    def func(x, *, flag="a"):
+        return "base"
+
+    @func.register
+    def _(x: int, *, flag: str = "a"):
+        return "str"
+
+    @func.register
+    def _(x: int, *, flag: int = 1):
+        return "int"
+
+    with pytest.raises(DispatchError, match="2 methods"):
+        func(1)
+    assert func(1, flag="z") == "str"
+    assert func(1, flag=5) == "int"
+
+    # same positional types, different binding shapes coexist and stay distinct
+
+    @multidispatch
+    def shaped(a, /, b):
+        return "positional-only"
+
+    @shaped.register
+    def _(a, b):
+        return "positional-or-keyword"
+
+    assert sum(isinstance(key, signature) for key in shaped) == 2
+    with pytest.raises(DispatchError, match="2 methods"):
+        shaped(1, 2)
+    assert shaped(a=1, b=2) == "positional-or-keyword"
+
+
+def test_keyword_same_types_different_signatures():
+    """Signatures with equal types but differing defaults are separate keys."""
+
+    @multidispatch
+    def func(x, *, mode="a"):
+        return "a"
+
+    @func.register
+    def _(x: int, *, mode: str = "b"):
+        return "b"
+
+    assert sum(isinstance(key, signature) for key in func) == 2
+
+
+def test_variadic_keyword_dispatch():
+    @multidispatch
+    def func(*xs, **kw):
+        return ("base", xs, kw)
+
+    @func.register
+    def _(*xs: int, tag: str = "t"):
+        return ("ints", xs, tag)
+
+    assert func(1, 2, tag="z") == ("ints", (1, 2), "z")
+    assert func(1, 2) == func(1, 2, tag="t") == ("ints", (1, 2), "t")
+    assert func(1, "a") == ("base", (1, "a"), {})
+
+
+def test_business_typeerror_propagates():
+    """A TypeError raised inside the body is not treated as a dispatch error."""
+
+    class BusinessError(TypeError):
+        pass
+
+    @multimethod
+    def mm(x: int):
+        raise BusinessError("body")
+
+    with pytest.raises(BusinessError):
+        mm(1)
+    with pytest.raises(DispatchError, match="0 methods"):
+        mm()
+
+    @multimethod
+    def needs_two(x: int, y):
+        return y
+
+    with pytest.raises(DispatchError, match="test_dispatch.py"):
+        needs_two(1)  # dispatch matches (y untyped), the call itself has wrong arity
+
+    @multidispatch
+    def md(x):
+        raise BusinessError("body")
+
+    with pytest.raises(BusinessError):
+        md(1)
+    with pytest.raises(DispatchError, match="0 methods"):
+        md(x=1, unexpected=2)
